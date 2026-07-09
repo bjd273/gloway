@@ -1,0 +1,17 @@
+{
+  "mjolnir": {
+    "tile_dir": "/tiles",
+    "max_cache_size": 1000000000,
+    "hierarchy": true,
+    "shortcuts": true,
+    "include_bicycle": true,
+    "include_pedestrian": true
+  },
+  "loki": {
+    "actions": ["locate", "route", "optimized_route", "sources_to_targets"],
+    "service": { "proxy": "none" }
+  },
+  "thor": {
+    "service": { "proxy": "none" }
+  }
+}

@@ -1,0 +1,17 @@
+# Temporary files
+.tmp/
+.env
+credentials.json
+token.json
+
+# OSM data downloads (regenerate via data/download_osm.sh)
+data/osm/*.pbf
+
+# Valhalla build output (regenerate via docker compose)
+valhalla/custom_files/*
+!valhalla/custom_files/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/

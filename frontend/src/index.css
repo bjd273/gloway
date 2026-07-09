@@ -1,0 +1,146 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+:root {
+  font-family: 'Inter', system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+
+  color-scheme: light dark;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #242424;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background-color: #111;
+}
+
+#root {
+  width: 100%;
+  height: 100%;
+}
+
+.map-container {
+  width: 100%;
+  height: 100%;
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+.floating-panel {
+  position: absolute;
+  top: 20px;
+  left: 20px;
+  width: 320px;
+  max-height: calc(100vh - 40px);
+  overflow-y: auto;
+  z-index: 10;
+  
+  /* Glassmorphism */
+  background: rgba(30, 30, 30, 0.75);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 16px;
+  padding: 20px;
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+  color: #fff;
+}
+
+.floating-panel h1 {
+  font-size: 20px;
+  font-weight: 600;
+  margin-top: 0;
+  margin-bottom: 16px;
+  color: #fff;
+}
+
+.instruction-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.instruction-item {
+  display: flex;
+  flex-direction: column;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  border-left: 4px solid #3b82f6;
+}
+
+.instruction-text {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.instruction-meta {
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.6);
+  margin-top: 4px;
+}
+
+.summary-card {
+  margin-bottom: 16px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid rgba(255,255,255,0.1);
+}
+
+.summary-card p {
+  margin: 4px 0;
+  font-size: 14px;
+}
+
+.drag-instruction {
+  font-size: 13px;
+  color: #aaa;
+  margin-bottom: 16px;
+  line-height: 1.4;
+}
+
+/* Custom Scrollbar for panel */
+.floating-panel::-webkit-scrollbar {
+  width: 6px;
+}
+.floating-panel::-webkit-scrollbar-track {
+  background: transparent;
+}
+.floating-panel::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.2);
+  border-radius: 10px;
+}
+
+/* Markers */
+.marker-origin {
+  background-color: #22c55e;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 3px solid #fff;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+  cursor: pointer;
+}
+
+.marker-destination {
+  background-color: #ef4444;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 3px solid #fff;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+  cursor: pointer;
+}

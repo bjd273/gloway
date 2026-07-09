@@ -1,0 +1,63 @@
+version: "3.9"
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: adaptivemap
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  valhalla:
+    image: ghcr.io/gis-ops/docker-valhalla/valhalla:latest
+    volumes:
+      - ./valhalla/custom_files:/custom_files
+      - valhalla_tiles:/tiles
+    ports:
+      - "8002:8002"
+    environment:
+      - use_tiles_ignore_pbf=True
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.11.1
+    ports:
+      - "5000:5000"
+    command: mlflow server --host 0.0.0.0 --backend-store-uri sqlite:///mlflow.db
+
+  backend:
+    build: ./backend
+    depends_on: [postgres, redis, valhalla, qdrant]
+    ports:
+      - "8000:8000"
+    env_file: .env
+
+  celery_worker:
+    build: ./backend
+    command: celery -A services.celery_app worker --loglevel=info
+    depends_on: [postgres, redis]
+    env_file: .env
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+
+volumes:
+  postgres_data:
+  valhalla_tiles:
+  qdrant_data:
