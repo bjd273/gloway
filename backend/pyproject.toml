@@ -5,7 +5,7 @@ description = "Backend for Adaptive Map"
 authors = [
     {name = "Your Name", email = "you@example.com"}
 ]
-requires-python = "^3.11"
+requires-python = ">=3.11,<4.0"
 dependencies = [
     "fastapi>=0.110.0",
     "uvicorn[standard]>=0.29.0",
@@ -51,6 +51,13 @@ flwr = ">=1.8.0"
 faster-whisper = ">=1.0.1"
 mlflow = ">=2.11.1"
 qdrant-client = ">=1.8.2"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
+markers = [
+    "integration: tests that hit a live Valhalla instance (skipped if unavailable)",
+]
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]

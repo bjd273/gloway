@@ -11,6 +11,12 @@ data/osm/*.pbf
 valhalla/custom_files/*
 !valhalla/custom_files/.gitkeep
 
+# Planetiler tile build output + auxiliary sources (regenerate via
+# `docker run ghcr.io/onthegomap/planetiler --osm-path=... --download`)
+data/tiles/
+data/sources/
+data/tile_weights.tsv.gz
+
 # Python
 __pycache__/
 *.pyc

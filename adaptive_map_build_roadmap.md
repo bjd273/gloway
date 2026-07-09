@@ -12,12 +12,13 @@
 1. [Tech Stack Master Reference](#tech-stack-master-reference)
 2. [Team Split & Ownership](#team-split--ownership)
 3. [Repository & Environment Setup](#repository--environment-setup)
-4. [Phase 1 — Base Route Planner](#phase-1--base-route-planner-weeks-1-8)
-5. [Phase 2 — LLM Conversation Layer](#phase-2--llm-conversation-layer-weeks-9-16)
-6. [Phase 3 — RL Personalization Engine](#phase-3--rl-personalization-engine-weeks-17-28)
-7. [Integration & End-to-End Testing](#integration--end-to-end-testing)
-8. [Deployment & Infrastructure](#deployment--infrastructure)
-9. [Milestone Checklist](#milestone-checklist)
+4. [Map Data Abstraction Layer](#map-data-abstraction-layer) — build this in Week 1–2, before any enrichment/use-case code
+5. [Phase 1 — Base Route Planner](#phase-1--base-route-planner-weeks-1-8)
+6. [Phase 2 — LLM Conversation Layer](#phase-2--llm-conversation-layer-weeks-9-16)
+7. [Phase 3 — RL Personalization Engine](#phase-3--rl-personalization-engine-weeks-17-28)
+8. [Integration & End-to-End Testing](#integration--end-to-end-testing)
+9. [Deployment & Infrastructure](#deployment--infrastructure)
+10. [Milestone Checklist](#milestone-checklist)
 
 ---
 
@@ -30,14 +31,22 @@
 | Database | PostgreSQL + PostGIS | PostGIS extension makes Postgres a full spatial database — required for road network queries. |
 | Cache / fast store | Redis | Sub-millisecond reads for user profiles, active sessions, real-time route state. |
 | Message queue | Celery + Redis | Async task processing for post-trip signal analysis, LLM reward extraction, RL updates. |
-| Map tile server | Martin (Rust) or pg_tileserv | Serves vector tiles directly from PostGIS. Extremely fast. |
+| Basemap vector tiles | Planetiler → PMTiles → Martin | Planetiler (BSD-3) generates OpenMapTiles-schema PMTiles directly from our own OSM extract — fully self-hosted, unambiguously free for commercial/startup use (unlike CARTO's hosted tiles or MapTiler Cloud's free tier, which is explicitly non-commercial-only). Martin serves the `.pmtiles` file; it can *also* serve directly from PostGIS later once crowdsourced dashcam updates need a live/dynamic tile layer (`road_segments`) alongside the static basemap. See "Self-hosted basemap tiles" under Week 1–2. |
 
 ### Routing Engine
 | Component | Technology | Why |
 |---|---|---|
-| Base routing engine | Valhalla (open source) | More flexible than OSRM — supports custom cost functions, which you NEED for RL weight injection. Runs as a local service. |
-| Map base data | OpenStreetMap (OSM) | Free, global, updated by community. Your real-time updates layer on top. |
+| Base routing engine | Valhalla (open source) | More flexible than OSRM — supports custom cost functions, which you NEED for RL weight injection. Runs as a local service. Never modify Valhalla's C++ core — see [Map Data Abstraction Layer](#map-data-abstraction-layer) for why differentiation happens above it, not inside it. |
+| Routing graph data | OpenStreetMap (OSM) | Free, global, updated by community, and the only data source with a mature offline tile-build pipeline into Valhalla. This does not change even if the places/geocoding layer below becomes hybrid. |
 | Graph representation | NetworkX → PyTorch Geometric | NetworkX for initial prototyping, PyTorch Geometric for production GNN. |
+
+### Map Data Layer (Places, Addresses, Enrichment)
+| Component | Technology | Why |
+|---|---|---|
+| Data abstraction | `backend/mapdata/` — a `MapDataSource` interface | Every enrichment feature (EV charging, delivery, cycling, scenic scoring, geocoding) is written against this interface, never against a specific provider. See [Map Data Abstraction Layer](#map-data-abstraction-layer). |
+| Places/POI source (v1) | OpenStreetMap via Overpass API or self-hosted extract | Free, matches the routing graph data, richest tagging for routing-relevant attributes (access rules, conditional restrictions). |
+| Places/POI source (future, optional) | [Overture Maps](https://overturemaps.org) | Cleaner, more consistent schema and better deduped buildings/places/addresses. Bolted on later as a second `MapDataSource` implementation, or blended via a `HybridMapDataSource` — zero rework to callers because they only ever see the interface. Do not adopt until OSM place-data quality is an actual measured bottleneck. |
+| Contract tests | pytest, parametrized over implementations | One shared test suite every `MapDataSource` implementation must pass (`backend/tests/mapdata/test_contract.py`), so swapping/adding a provider can't silently break enrichment logic. |
 
 ### ML / AI
 | Component | Technology | Why |
@@ -97,6 +106,7 @@ Clear ownership prevents stepping on each other. These are defaults — you'll o
 - User profile data schema (it touches ML and backend equally)
 - API contracts between ML services and the main backend
 - End-to-end testing of the full journey flow
+- The `MapDataSource` interface in `backend/mapdata/` (see [Map Data Abstraction Layer](#map-data-abstraction-layer)) — You own `osm_source.py` and its routing-relevant tag mapping; Jonathan owns wiring `get_map_data_source()` into API route handlers (geocoding, places lookups) instead of calling providers directly. Neither of you should ever import `httpx` to hit Overpass/Nominatim/Overture from inside `api/` or `ml/` — always go through the interface.
 
 ---
 
@@ -111,8 +121,18 @@ Create one monorepo. Jonathan sets this up and invites you.
 ```
 adaptive-map/
 ├── backend/                  # FastAPI + all Python services
+│   ├── config.py             # pydantic-settings Settings — single source of truth for env-derived
+│   │                         #   config (valhalla_url, etc). Import `from config import settings`.
 │   ├── api/                  # Route handlers, request/response models
 │   ├── routing/              # Valhalla client, cost function injection
+│   ├── mapdata/              # Data abstraction layer — see "Map Data Abstraction Layer"
+│   │   ├── models.py         # Place, Address, BBox, PlaceCategory, RoutingGraphRef — the only
+│   │   │                     #   vocabulary enrichment code is allowed to speak
+│   │   ├── base.py           # MapDataSource ABC — the interface everything else is written against
+│   │   ├── osm_source.py     # OSMMapDataSource — v1 implementation, Overpass or self-hosted extract
+│   │   ├── overture_source.py  # OvertureMapDataSource — stub now, real once OSM places are a bottleneck
+│   │   ├── hybrid_source.py    # Combines sources per-method (e.g. OSM routing + Overture places)
+│   │   └── factory.py        # get_map_data_source() — reads settings.map_data_source, returns impl
 │   ├── ml/                   # GNN, RL, preference embedding code
 │   │   ├── gnn/
 │   │   ├── rl/
@@ -121,6 +141,8 @@ adaptive-map/
 │   ├── services/             # Celery tasks, background workers
 │   ├── db/                   # SQLAlchemy models, Alembic migrations
 │   └── tests/
+│       └── mapdata/
+│           └── test_contract.py   # Shared test suite every MapDataSource impl must pass
 ├── frontend/                 # React + TypeScript
 │   ├── src/
 │   │   ├── components/
@@ -128,10 +150,20 @@ adaptive-map/
 │   │   ├── stores/           # Zustand state
 │   │   └── services/         # API client code
 │   └── tests/
-├── valhalla/                 # Valhalla config files and custom costing
+├── valhalla/                 # Valhalla config + custom_files/ (gitignored build output — the
+│                             #   region .osm.pbf and generated valhalla_tiles.tar live here)
 ├── data/                     # OSM data download scripts, pipeline scripts
+│   ├── osm/                  # Downloaded .pbf extracts (gitignored — regenerate via download_osm.sh)
+│   ├── tiles/                # Planetiler PMTiles output, e.g. region.pmtiles (gitignored — regenerate)
+│   └── sources/              # Planetiler's auxiliary downloads: water polygons, Natural Earth,
+│                             #   lake centerlines (gitignored, ~1.3GB, fetched via --download once)
 ├── infra/                    # Docker Compose, Terraform (later), Nginx config
-│   └── docker-compose.yml
+│   └── docker-compose.yml    # Run with `--project-directory .` from the repo root — the compose
+│                             #   file lives in infra/, and Compose resolves relative volume paths
+│                             #   and .env against its OWN directory by default, not the repo root.
+│                             #   Without this flag, `.env` and bind-mount paths silently fail to
+│                             #   resolve. Full command:
+│                             #   docker compose -f infra/docker-compose.yml --project-directory . up -d <service>
 ├── mlflow/                   # MLflow tracking server config
 ├── notebooks/                # Jupyter notebooks for ML experimentation
 └── docs/                     # Architecture decisions, API docs
@@ -161,16 +193,60 @@ nvm use 20
 
 ### Step 3 — Python dependencies (backend/pyproject.toml)
 
+**Two things the original plan got wrong, fixed here:**
+
+1. **`poetry install` will fail outright without `package-mode = false`.** A PEP 621 `[project]` table with no matching installable package directory (no `backend/adaptive_map_backend/`) makes Poetry 2.x try to build/install the project as its own package and error out. Add to `pyproject.toml`:
+   ```toml
+   [tool.poetry]
+   package-mode = false
+   ```
+2. **Don't install the full ML stack (torch, ray[rllib], flwr, mlflow, faster-whisper, qdrant-client) in one flat `poetry add`.** They're multi-GB and irrelevant until Phase 2/3, so a `poetry install` for a Phase 1 DB/routing task would burn 10+ minutes and several GB for nothing. Put them in an **optional** Poetry group instead, so `poetry install` stays fast through Phase 1, and `poetry install --with ml` pulls them in whenever Phase 2/3 work actually starts:
+
+```toml
+[project]
+dependencies = [
+  "fastapi>=0.110.0", "uvicorn[standard]>=0.29.0", "sqlalchemy>=2.0.29",
+  "alembic>=1.13.1", "asyncpg>=0.29.0", "psycopg2-binary>=2.9.9",
+  "geoalchemy2>=0.14.0",   # PostGIS Geography/Geometry columns in SQLAlchemy — the
+                           # original plan's dependency list omitted this; the DB schema
+                           # step below needs it for GEOGRAPHY(Point,4326) etc.
+  "redis>=5.0.3", "celery>=5.3.6", "aioredis>=2.0.1", "httpx>=0.27.0",
+  "python-dotenv>=1.0.1", "pydantic-settings>=2.2.1",
+  "geopandas>=0.14.3", "shapely>=2.0.3", "anthropic>=0.21.3", "openai>=1.14.2",
+]
+
+[tool.poetry]
+package-mode = false
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.1.1"
+pytest-asyncio = "^0.23.6"
+httpx = "^0.27.0"
+black = "^24.3.0"
+ruff = "^0.3.4"
+mypy = "^1.9.0"
+
+[tool.poetry.group.ml]
+optional = true
+
+[tool.poetry.group.ml.dependencies]
+torch = ">=2.2.1"
+torchvision = ">=0.17.1"
+torch-geometric = ">=2.5.2"
+stable-baselines3 = ">=2.2.1"
+gymnasium = ">=0.29.1"
+ray = {version = ">=2.10.0", extras = ["rllib"]}
+flwr = ">=1.8.0"
+faster-whisper = ">=1.0.1"
+mlflow = ">=2.11.1"
+qdrant-client = ">=1.8.2"
+```
+
 ```bash
 cd backend
-poetry init
-poetry add fastapi uvicorn[standard] sqlalchemy alembic asyncpg \
-  psycopg2-binary redis celery aioredis httpx python-dotenv \
-  pydantic-settings geopandas shapely anthropic openai \
-  torch torchvision torch-geometric \
-  stable-baselines3 gymnasium ray[rllib] flwr \
-  faster-whisper mlflow qdrant-client
-poetry add --group dev pytest pytest-asyncio httpx black ruff mypy
+poetry lock
+poetry install              # main + dev only — fast, no ML stack
+# poetry install --with ml  # run this instead once Phase 2/3 ML work starts
 ```
 
 ### Step 4 — Docker Compose base
@@ -203,7 +279,22 @@ services:
     ports:
       - "8002:8002"
     environment:
+      # False for the FIRST build so the image's entrypoint actually processes
+      # the .osm.pbf in custom_files/ and writes tiles; True afterwards so
+      # restarts skip rebuilding and just load the cached valhalla_tiles.tar.
       - use_tiles_ignore_pbf=True
+
+  # Serves the self-hosted basemap (see "Self-hosted basemap tiles" under
+  # Week 1-2) from a Planetiler-built PMTiles file — not from PostGIS, at
+  # least not yet. Martin can serve PostGIS directly too, which is the planned
+  # path once crowdsourced dashcam updates need a live/dynamic tile layer.
+  martin:
+    image: ghcr.io/maplibre/martin:latest
+    volumes:
+      - ./data/tiles:/tiles
+    ports:
+      - "3001:3000"
+    command: --listen-addresses 0.0.0.0:3000 /tiles
 
   qdrant:
     image: qdrant/qdrant:latest
@@ -255,6 +346,8 @@ MLFLOW_TRACKING_URI=http://mlflow:5000
 SECRET_KEY=generate_a_long_random_string_here
 ```
 
+**Hostnames like `postgres`, `valhalla`, `martin` only resolve inside the Docker Compose network.** Any tool you run directly on your laptop (Alembic migrations, a one-off `psql`, `backend/config.py`'s `valhalla_url` default when running FastAPI outside Docker) needs `localhost` instead, using the same port each service publishes to the host (`localhost:5432`, `localhost:8002`, `localhost:3001`). `backend/db/migrations/env.py` handles this automatically for Alembic — it reads `DATABASE_URL`, swaps `postgresql+asyncpg://` for `postgresql+psycopg2://` (Alembic runs synchronously), and rewrites `@postgres:5432` to `@localhost:5432` — with an `ALEMBIC_DATABASE_URL` env var available to override entirely if needed. `backend/config.py` similarly defaults `valhalla_url` to `http://localhost:8002` rather than hardcoding the container hostname.
+
 ---
 
 ## Phase 1 — Base Route Planner (Weeks 1–8)
@@ -269,114 +362,127 @@ SECRET_KEY=generate_a_long_random_string_here
 
 #### Get OSM data
 
-Download a regional extract to start (your city or state, not the whole world yet). Use Geofabrik — they provide daily updated OSM extracts.
+Download a regional extract to start (your city or state, not the whole world yet), then crop further to a small bounding box for fast local dev iteration — a tiny extract (~1MB) means Valhalla/Planetiler builds finish in seconds instead of the 15–45 minutes a full-state extract takes. Use Geofabrik for the state download, `osmium extract` for the crop.
 
 ```bash
+#!/bin/bash
 # data/download_osm.sh
+set -e
+
 mkdir -p data/osm
-# Example: Initializing Agent Architecture Framework
-2:10 PM
-I have updated the implementation plan in the 
-implementation_plan.md
- artifact to specifically include cropping the OSM data to the Central Arlington bounding box (bounded by I-30, W Park Row Dr, Fielder Rd, Collins St) using osmium extract.
 
-Please review the updated plan and let me know if it looks good, or if you'd like any other adjustments before we begin the instantiation process!
+echo "Downloading Texas OSM extract..."
+# macOS doesn't ship wget by default — curl is the portable choice here.
+curl -L "https://download.geofabrik.de/north-america/us/texas-latest.osm.pbf" -o data/osm/texas.osm.pbf || true
 
-Implementation Plan
-1:59 PM
-Proceeded with
-Implementation Plan
-I've completed the environment setup and instantiated the initial repository structure based on the roadmap.
+echo "Cropping to Central Arlington bounding box..."
+# Bounding box: I-30, W Park Row Dr, Fielder Rd, Collins St
+# BBox format: min_lon,min_lat,max_lon,max_lat
+osmium extract -b -97.140,32.715,-97.080,32.760 data/osm/texas.osm.pbf -o data/osm/region.osm.pbf --overwrite
 
-You can review the summary of the work done in the 
-walkthrough.md
- artifact. Let me know if you would like me to proceed with the next steps (such as downloading the map data and building the Valhalla routing tiles).
-
-Task
-Walkthrough
-2:16 PM
-Lets move on to phase 1. lets start with getting OSM Data first
-4:24 PM
-I've successfully updated the script for macOS compatibility (switching from wget to curl) and ran it to pull down the OSM Data!
-
-The Texas extract (~676 MB) was downloaded, and we used osmium to successfully crop the map down exactly to the Central Arlington bounding box (-97.140, 32.715, -97.080, 32.760).
-
-The cropped data is now sitting securely in 
-
-region.osm.pbf
-, which is a lean 1.06MB file perfectly primed for our initial development. I've tracked this update in the 
-walkthrough
- and 
-task
- lists.
-
-According to our roadmap for Phase 1, the next step is to build Valhalla tiles from this OSM data using Docker. Would you like me to proceed with building the routing tiles and spinning up the backend container infrastructure?
-
-Task
-Walkthrough
-4:23 PM
-7:39 PM
-Texas extract (~700MB). Replace with your region.
-wget https://download.geofabrik.de/north-america/us/texas-latest.osm.pbf \
-  -O data/osm/region.osm.pbf
-
-# Verify the download
+echo "Verifying the cropped extract..."
 osmium fileinfo data/osm/region.osm.pbf
 ```
 
+This produces two files, both gitignored (regenerate via this script, never commit — `texas.osm.pbf` is ~700MB):
+- `data/osm/texas.osm.pbf` — the full state extract, kept around so re-cropping to a different/larger bbox later doesn't require re-downloading.
+- `data/osm/region.osm.pbf` — the actual ~1MB extract everything else in Week 1–2 (Valhalla tiles, Planetiler basemap tiles) builds from. Swap the bounding box and re-run once you're ready to cover more than one small area — everything downstream (Valhalla, Planetiler) rebuilds from this file unchanged.
+
 #### Build Valhalla tiles from OSM data
 
-Valhalla needs to pre-process OSM data into its own tile format. This takes 15–45 minutes depending on region size.
+**Do not use `valhalla_build_config`/`valhalla_build_tiles` directly — that's for the generic Valhalla image.** The `ghcr.io/gis-ops/docker-valhalla/valhalla` image used in `docker-compose.yml` ships its own entrypoint that builds tiles automatically from whatever `.osm.pbf` it finds in the mounted `/custom_files` directory — running the raw commands against this image either does nothing useful or duplicates what the entrypoint already does.
 
 ```bash
-# valhalla/valhalla.json — Valhalla configuration
-{
-  "mjolnir": {
-    "tile_dir": "/tiles",
-    "max_cache_size": 1000000000,
-    "hierarchy": true,
-    "shortcuts": true,
-    "include_bicycle": true,
-    "include_pedestrian": true
-  },
-  "loki": {
-    "actions": ["locate", "route", "optimized_route", "sources_to_targets"],
-    "service": { "proxy": "none" }
-  },
-  "thor": {
-    "service": { "proxy": "none" }
-  }
-}
+# 1. Put the extract where the container's entrypoint looks for it
+cp data/osm/region.osm.pbf valhalla/custom_files/region.osm.pbf
 
-# Build tiles (run inside the valhalla container)
-docker compose run valhalla valhalla_build_config \
-  --mjolnir-tile-dir /tiles \
-  --mjolnir-timezone /tiles/tz_world.sqlite \
-  --mjolnir-admin /tiles/admins.sqlite > valhalla/valhalla.json
+# 2. First build: set use_tiles_ignore_pbf=False in docker-compose.yml's valhalla
+#    service (see Step 4) so the entrypoint actually processes the .pbf instead
+#    of looking for a tile.tar that doesn't exist yet.
 
-docker compose run valhalla valhalla_build_tiles \
-  -c /custom_files/valhalla.json \
-  /custom_files/region.osm.pbf
+# 3. Build + start — the entrypoint builds tiles, tars them, THEN starts
+#    valhalla_service on 8002. Watch the logs for "Successfully built files"
+#    and "Starting valhalla service!"
+docker compose -f infra/docker-compose.yml --project-directory . up -d valhalla
+docker logs -f gloway-valhalla-1
+
+# 4. Once built, flip use_tiles_ignore_pbf back to True and restart — this
+#    skips the pbf hash-check/rebuild and just loads the cached
+#    valhalla_tiles.tar, so subsequent starts are near-instant.
+docker compose -f infra/docker-compose.yml --project-directory . up -d valhalla
+```
+
+For our ~1MB Central Arlington extract this whole build takes seconds, not the 15–45 minutes a full-state build would (which is exactly why Week 1–2's OSM step crops to a small bbox first — see above). Verify with a real route request, not just "the container started":
+
+```bash
+curl -s http://localhost:8002/route --data \
+  '{"locations":[{"lat":32.720,"lon":-97.130},{"lat":32.755,"lon":-97.090}],"costing":"auto"}'
+```
+
+A response with real street names in `maneuvers[].instruction` confirms the tiles are actually routable, not just that the service is up.
+
+#### Self-hosted basemap tiles (not in the original plan — needed for the frontend map, and for startup-safe licensing)
+
+The routing tiles above make Valhalla answer "what's the route" — a separate thing entirely is the **visual basemap** MapLibre renders in the browser (roads, buildings, labels, water). The original plan didn't cover this at all. Whatever you reach for here has real licensing implications for a commercial product — worth getting right before it's load-bearing:
+
+| Option | Free for a startup? | Why / why not |
+|---|---|---|
+| CARTO hosted tiles (`basemaps.cartocdn.com`) | Free tier exists, but a third-party service you don't control — no SLA, rate limits, terms can change | Fine for throwaway prototyping, not for anything load-bearing |
+| MapTiler Cloud hosted tiles | **No** — free tier is explicitly "non-commercial use" only; commercial use requires a paid plan | A startup using this "for free" is violating their ToS |
+| Protomaps hosted API | **No** — free up to 1M requests/mo, but commercial use past that requires a paid GitHub Sponsorship | Same "free tier ≠ free for startups" pattern as MapTiler |
+| **Self-hosted: Planetiler → PMTiles → Martin** | **Yes, unambiguously** | Planetiler (BSD-3) generates OpenMapTiles-schema tiles from data *you already downloaded* (`region.osm.pbf`); Martin (already in the tech stack table) serves the result. No third party, no rate limit, no ToS to violate. |
+
+The OpenMapTiles schema itself is BSD-3 (code) + CC-BY 4.0 (cartography design) — free for commercial use, **with a visible attribution requirement**: `© OpenMapTiles © OpenStreetMap contributors`. Martin's `/catalog` endpoint embeds this attribution automatically once you generate a tileset via Planetiler's default profile.
+
+```bash
+# Generate self-hosted vector tiles from the same extract used for Valhalla.
+# Default Planetiler output IS the OpenMapTiles schema — no extra flag needed.
+# --download fetches small one-time public-domain auxiliary layers (water
+# polygons, Natural Earth, lake centerlines) into data/sources/ (~1.3GB,
+# gitignored, cached after first run).
+mkdir -p data/tiles
+docker run --rm -e JAVA_TOOL_OPTIONS="-Xmx2g" -v "$(pwd)/data:/data" \
+  ghcr.io/onthegomap/planetiler:latest \
+  --osm-path=/data/osm/region.osm.pbf \
+  --output=/data/tiles/region.pmtiles \
+  --download
+```
+
+This produces a single `.pmtiles` file (a few hundred KB for our small extract). Martin serves it directly — see the `martin` service in Step 4's `docker-compose.yml` above — exposing normal `{z}/{x}/{y}` tile endpoints at `http://localhost:3001/region/...` plus a TileJSON at `http://localhost:3001/region`.
+
+**Frontend wiring gotcha, whenever the frontend is wired to this tile source:** MapLibre's tile fetches run inside a Blob-URL Web Worker, which cannot resolve *relative* tile URL templates (`new Request()` throws `Failed to parse URL from /api/tiles/...` — silently breaks every tile request, no visible error unless you check the console). Don't bake a relative or absolute-with-hardcoded-host path into a committed style JSON; resolve the tile source's `tiles` array against `window.location.origin` at map-construction time instead, right before constructing `new maplibregl.Map(...)` — this also keeps the style file itself environment-agnostic across dev/staging/prod.
+
+**Vector tile style:** don't write a MapLibre style from scratch. [OpenFreeMap](https://openfreemap.org)'s published styles (`liberty`, etc.) are free, open-source (same BSD/CC0 license family), built for exactly this schema, and already include a `building-3d` fill-extrusion layer. Vendor one into the frontend and repoint its `sources.openmaptiles` at your own Martin instance instead of OpenFreeMap's — fonts/sprites can stay pointed at OpenFreeMap's free CDN since they're generic cartographic assets, not map data.
+
+**Future production path (not needed yet):** the `.pmtiles` format (stewarded by Protomaps, public domain) can be served with *no* backend process at all — MapLibre can fetch byte ranges directly from a static file on S3/Cloudflare R2/GitHub Pages via the `pmtiles` JS protocol plugin. That's the cheapest option for a basemap that rebuilds occasionally. Martin stays relevant specifically because it can *also* serve tiles directly from PostGIS — the path for once crowdsourced dashcam updates need to render as a live/dynamic tile layer (`road_segments`), which a frozen static file fundamentally can't do. Don't switch to serverless PMTiles until there's actual cost/scale pressure; Martin already unifies tooling with the Postgres/PostGIS stack Week 1–2 sets up.
+
+Add to `.gitignore` (all regenerable, all potentially large — never commit):
+```
+data/osm/*.pbf
+data/tiles/
+data/sources/
+valhalla/custom_files/*
+!valhalla/custom_files/.gitkeep
 ```
 
 #### PostGIS schema
 
+**Don't hand-write this SQL and run it directly — define it as SQLAlchemy models and let Alembic autogenerate the migration.** The shape below is still the target schema (kept for reference), but the actual source of truth is `backend/db/models.py`; there is no `db/migrations/001_initial_schema.sql` file on disk. Two changes from a literal reading of this SQL:
+
+- **`gen_random_uuid()` instead of `uuid_generate_v4()`/`uuid-ossp`.** Postgres 16 (what `docker-compose.yml` runs) has `gen_random_uuid()` built into core — one less extension to install and manage. Functionally identical output (random v4 UUIDs).
+- **`postgis` extension only** — drop the `uuid-ossp` `CREATE EXTENSION` line.
+
 ```sql
--- db/migrations/001_initial_schema.sql
-
--- Enable PostGIS
+-- Target schema shape (reference only — source of truth is db/models.py)
 CREATE EXTENSION IF NOT EXISTS postgis;
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- Users
 CREATE TABLE users (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   email VARCHAR(255) UNIQUE NOT NULL,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   onboarding_completed BOOLEAN DEFAULT FALSE
 );
 
--- User preferences (starts simple, grows with ML)
 CREATE TABLE user_preferences (
   user_id UUID REFERENCES users(id) ON DELETE CASCADE,
   avoid_highways BOOLEAN DEFAULT FALSE,
@@ -384,59 +490,548 @@ CREATE TABLE user_preferences (
   avoid_left_turns BOOLEAN DEFAULT FALSE,
   prefer_scenic BOOLEAN DEFAULT FALSE,
   max_acceptable_detour_minutes INT DEFAULT 5,
-  -- Preference embedding stored here once ML layer is built
   preference_vector FLOAT[] DEFAULT NULL,
   updated_at TIMESTAMPTZ DEFAULT NOW(),
   PRIMARY KEY (user_id)
 );
 
--- Trips (every navigation session is recorded)
 CREATE TABLE trips (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID REFERENCES users(id),
   origin GEOGRAPHY(POINT, 4326) NOT NULL,
   destination GEOGRAPHY(POINT, 4326) NOT NULL,
-  suggested_route JSONB NOT NULL,          -- The route we suggested
-  actual_path_taken JSONB DEFAULT NULL,    -- GPS trace of what user actually drove
+  suggested_route JSONB NOT NULL,
+  actual_path_taken JSONB DEFAULT NULL,
   started_at TIMESTAMPTZ DEFAULT NOW(),
   completed_at TIMESTAMPTZ DEFAULT NULL,
-  context JSONB DEFAULT '{}',              -- Time of day, weather, declared intent
-  implicit_signals JSONB DEFAULT '{}',     -- Deviations, app switches, pace changes
-  explicit_feedback TEXT DEFAULT NULL,     -- Post-trip user text
-  reward_value FLOAT DEFAULT NULL          -- Computed reward for RL (filled later)
+  context JSONB DEFAULT '{}',
+  implicit_signals JSONB DEFAULT '{}',
+  explicit_feedback TEXT DEFAULT NULL,
+  reward_value FLOAT DEFAULT NULL
 );
 
--- Index for spatial queries
 CREATE INDEX idx_trips_origin ON trips USING GIST(origin);
 CREATE INDEX idx_trips_destination ON trips USING GIST(destination);
 CREATE INDEX idx_trips_user_id ON trips(user_id);
 
--- Road segments we know about (starts from OSM, grows with user updates)
 CREATE TABLE road_segments (
   id BIGSERIAL PRIMARY KEY,
   osm_way_id BIGINT,
   geom GEOGRAPHY(LINESTRING, 4326) NOT NULL,
   name VARCHAR(255),
-  highway_type VARCHAR(50),       -- motorway, primary, residential, etc.
+  highway_type VARCHAR(50),
   speed_limit_kph INT,
   lanes INT,
   one_way BOOLEAN DEFAULT FALSE,
   last_verified_at TIMESTAMPTZ DEFAULT NOW(),
-  confidence_score FLOAT DEFAULT 1.0     -- drops if conflicting reports
+  confidence_score FLOAT DEFAULT 1.0
 );
 
 CREATE INDEX idx_road_segments_geom ON road_segments USING GIST(geom);
 ```
 
-Run migrations with Alembic:
+**Actual steps, in order:**
+
+1. Add `geoalchemy2>=0.14.0` to `pyproject.toml` (already covered in Step 3 above) — needed for `Geography`/`Geometry` column types in SQLAlchemy.
+2. Bring up Postgres: `docker compose -f infra/docker-compose.yml --project-directory . up -d postgres`.
+3. Write `backend/db/base.py` (`Base = DeclarativeBase` subclass) and `backend/db/models.py` (the 4 tables above as SQLAlchemy 2.0 ORM models — `UUID(as_uuid=True)` + `server_default=text("gen_random_uuid()")` for PKs, `geoalchemy2.Geography(geometry_type=..., srid=4326, spatial_index=True)` for spatial columns, `sqlalchemy.dialects.postgresql.JSONB` for JSON columns, an explicit `Index("idx_trips_user_id", "user_id")` since `spatial_index=True` only auto-creates the *spatial* GIST indexes).
+4. `cd backend && poetry run alembic init db/migrations`, then edit `db/migrations/env.py`:
+   - `target_metadata = Base.metadata` (import `db.base.Base` and `db.models` so every model registers).
+   - **Required, not optional:** wire a custom `include_object` into `context.configure(...)`. The `postgis/postgis` Docker image auto-creates `postgis_tiger_geocoder`/`postgis_topology` extension tables (`county`, `state`, `edges`, `topology`, `layer`, ~30 more) directly in `public` on database init. Without filtering these out, the *first* `alembic revision --autogenerate` proposes `DROP TABLE` for all of them. Fix: skip any reflected table with no corresponding SQLAlchemy model (`type_ == "table" and reflected and compare_to is None`), combined with `geoalchemy2.alembic_helpers.include_object` (which only filters `spatial_ref_sys`, not the tiger/topology tables — insufficient alone).
+   - Use `geoalchemy2.alembic_helpers.render_item` (renders `Geography`/`Geometry` types correctly instead of falling back to plain `String`) and `.writer` for `process_revision_directives`.
+   - A `get_url()` helper implementing the `localhost`-vs-container-hostname + async-vs-sync-driver rewrite described in Step 5 above.
+5. `poetry run alembic revision --autogenerate -m "initial schema"`, then **manually add `op.execute("CREATE EXTENSION IF NOT EXISTS postgis")`** at the top of `upgrade()` — autogenerate never emits `CREATE EXTENSION` statements — and verify the diff only touches the 4 tables above (no stray tiger/topology drops) before applying.
+6. `poetry run alembic upgrade head`.
 
 ```bash
 cd backend
-alembic init db/migrations
-# Edit alembic.ini to point to your DATABASE_URL
-alembic revision --autogenerate -m "initial schema"
-alembic upgrade head
+poetry run alembic init db/migrations
+# edit env.py per the steps above — this is NOT optional, autogenerate breaks without it
+poetry run alembic revision --autogenerate -m "initial schema"
+# manually add CREATE EXTENSION postgis + review the diff
+poetry run alembic upgrade head
 ```
+
+---
+
+## Map Data Abstraction Layer
+
+**Build this in Week 1–2, alongside the OSM pipeline above, before writing any enrichment or use-case code (EV charging, delivery, cycling, scenic scoring, etc.).**
+
+### Why this exists
+
+We are not modifying Valhalla's C++ core, and we are not choosing between OSM and Overture Maps as a one-time decision. The differentiation for this product (personalization, use-case-specific routing, richer place data) lives in layers *above* the routing engine, and those layers must not be hardwired to one map data provider. OSM is what we build on first — it's free, mature, and has the only production-ready pipeline into Valhalla tiles. Overture Maps may get added later purely for cleaner places/addresses/buildings data (see the Tech Stack table above), but that is an implementation swap, not an architecture change, **if and only if** every enrichment feature is written against a stable interface from day one instead of calling OSM directly.
+
+Two data paths exist in this system and they are **not** the same thing:
+
+1. **Routing graph data** — the OSM `.pbf` extract that gets built into Valhalla tiles offline (Week 1–2, above). This stays OSM-only for the foreseeable future; there is no mature Overture-to-routing-graph pipeline yet. Nothing in this section changes that.
+2. **Places / addresses / enrichment data** — POIs (EV chargers, parks, restaurants, parking), geocoding, and any per-use-case metadata (bike lane tags, safety scores, etc.). **This** is the path that gets abstracted, because this is where a provider swap or blend is plausible.
+
+### The hard rule for the coding agent
+
+> **No code outside `backend/mapdata/` may import `httpx`/`requests` and call Overpass, Nominatim, or Overture directly.** Every place lookup, every geocode call, every POI query goes through `mapdata.factory.get_map_data_source()`. If you are writing an enrichment feature (EV charging waypoints, delivery stop geocoding, cycling POI overlays, anything in Phase 2/3 that needs "find me X near Y") and you catch yourself constructing an Overpass query or a Nominatim URL inline — stop, and add the method to `MapDataSource` instead. This is the one architectural rule in this document with zero exceptions.
+
+### `backend/mapdata/models.py` — the shared vocabulary
+
+Every implementation of `MapDataSource` translates its provider's schema into these types. Business logic never sees an OSM tag or an Overture schema field — it sees a `Place` with a `PlaceCategory`.
+
+```python
+# backend/mapdata/models.py
+"""Normalized data models shared by every MapDataSource implementation.
+
+Enrichment code (EV charging, delivery, cycling, geocoding, ...) is written
+against these types only. Translation from a provider's native schema (OSM
+tags, Overture's GERS schema, a future custom feed) happens exactly once,
+inside that provider's MapDataSource implementation. This is what makes
+adding or blending a second provider a same-day change instead of a rewrite.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+
+
+class PlaceCategory(str, Enum):
+    """Common category taxonomy across all providers.
+
+    Add new members here as new use cases need them (e.g. a ``PLAYGROUND``
+    category for a "parent mode"). Never invent a provider-specific string in
+    calling code — every MapDataSource implementation is responsible for
+    mapping its own vocabulary onto this enum, including an ``OTHER`` fallback
+    for anything unmapped.
+    """
+
+    EV_CHARGING = "ev_charging"
+    FUEL = "fuel"
+    PARKING = "parking"
+    PARK = "park"
+    RESTAURANT = "restaurant"
+    GROCERY = "grocery"
+    LODGING = "lodging"
+    BIKE_PARKING = "bike_parking"
+    TRANSIT_STOP = "transit_stop"
+    OTHER = "other"
+
+
+@dataclass(frozen=True)
+class BBox:
+    min_lat: float
+    min_lon: float
+    max_lat: float
+    max_lon: float
+
+
+@dataclass(frozen=True)
+class Place:
+    """A single point of interest, normalized across providers."""
+
+    id: str                        # provider-prefixed, e.g. "osm:node/12345", "overture:place/abc"
+    name: str | None
+    category: PlaceCategory
+    lat: float
+    lon: float
+    source: str                    # "osm" | "overture" | "custom:<provider>"
+    # Raw provider tags/fields, kept for enrichment logic that needs specifics
+    # a normalized field can't capture yet (e.g. EV connector type, plug count).
+    # Reach for a new typed field on Place before reaching into metadata by hand
+    # in more than one call site — that's the signal it should be promoted.
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Address:
+    id: str
+    formatted: str
+    lat: float
+    lon: float
+    source: str
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RoutingGraphRef:
+    """Pointer to a built routing graph (Valhalla tileset), not the graph itself.
+
+    The routing graph is built offline from OSM only (see Week 1-2) regardless
+    of which provider backs get_places/search_addresses. This type exists so
+    the interface is complete and callers have one place to ask "which
+    tileset/region am I routing against" without reaching into valhalla/
+    config directly. ``source`` is expected to always be "osm" today.
+    """
+
+    region_id: str
+    built_at: str
+    source: str
+```
+
+### `backend/mapdata/base.py` — the interface
+
+```python
+# backend/mapdata/base.py
+"""Abstract interface every map data source must implement.
+
+Adding Overture, or blending it with OSM, means writing one new class in this
+package and flipping `settings.map_data_source` in config.py — nothing above
+this layer (API routes, enrichment logic, ML feature extraction) changes.
+Every implementation must pass `backend/tests/mapdata/test_contract.py`
+before it is wired into `factory.get_map_data_source()`.
+"""
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+
+from mapdata.models import Address, BBox, Place, PlaceCategory, RoutingGraphRef
+
+
+class MapDataSource(ABC):
+    @abstractmethod
+    async def get_places(self, category: PlaceCategory, bbox: BBox) -> list[Place]:
+        """All places of one category inside bbox.
+
+        Must return an empty list, never None or raise, when nothing matches —
+        callers (e.g. EV charging waypoint insertion) treat "no results" as a
+        normal case, not an error path.
+        """
+
+    @abstractmethod
+    async def get_place_by_id(self, place_id: str) -> Place | None:
+        ...
+
+    @abstractmethod
+    async def search_addresses(self, query: str, limit: int = 5) -> list[Address]:
+        """Free-text geocoding. Replaces calling Nominatim/Overture geocoding
+        directly from route handlers — see the Week 5-6 geocoding note below."""
+
+    @abstractmethod
+    async def get_routing_graph_ref(self, bbox: BBox) -> RoutingGraphRef:
+        """Which built routing tileset covers this bbox. Metadata only —
+        actual routing still goes through routing.valhalla_client."""
+```
+
+### `backend/mapdata/osm_source.py` — the v1 implementation
+
+```python
+# backend/mapdata/osm_source.py
+"""OSM-backed MapDataSource — the only implementation needed through Phase 2.
+
+Uses the public Overpass API for get_places/search_addresses (fine for
+development and low query volume). Once query volume matters, replace
+_query_raw_places'/`_query_raw_addresses`'s internals with reads against a
+PostGIS table bulk-loaded from the same .pbf via osmium/imposm — the public
+interface below does not change, so nothing calling this class needs to know
+which one is happening.
+
+get_routing_graph_ref always reports source="osm": the routing graph build
+in valhalla/ is OSM-only regardless of what this class (or a future
+OvertureMapDataSource/HybridMapDataSource) backs places/addresses with.
+"""
+from __future__ import annotations
+
+import httpx
+
+from mapdata.base import MapDataSource
+from mapdata.models import Address, BBox, Place, PlaceCategory, RoutingGraphRef
+
+_OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+_NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+_USER_AGENT = "AdaptiveMapApp/0.1 contact@yourapp.com"
+
+# OSM (key, value) tag -> normalized category. Extend this as new use cases
+# need new categories — this table is the ONLY place OSM tag vocabulary
+# should appear outside of osm_source.py itself.
+_OSM_TAG_TO_CATEGORY: dict[tuple[str, str], PlaceCategory] = {
+    ("amenity", "charging_station"): PlaceCategory.EV_CHARGING,
+    ("amenity", "fuel"): PlaceCategory.FUEL,
+    ("amenity", "parking"): PlaceCategory.PARKING,
+    ("leisure", "park"): PlaceCategory.PARK,
+    ("amenity", "restaurant"): PlaceCategory.RESTAURANT,
+    ("shop", "supermarket"): PlaceCategory.GROCERY,
+    ("tourism", "hotel"): PlaceCategory.LODGING,
+    ("amenity", "bicycle_parking"): PlaceCategory.BIKE_PARKING,
+    ("highway", "bus_stop"): PlaceCategory.TRANSIT_STOP,
+}
+_CATEGORY_TO_OSM_TAG = {v: k for k, v in _OSM_TAG_TO_CATEGORY.items()}
+
+
+class OSMMapDataSource(MapDataSource):
+    def __init__(self, client: httpx.AsyncClient | None = None):
+        self._client = client or httpx.AsyncClient(timeout=30.0)
+
+    async def get_places(self, category: PlaceCategory, bbox: BBox) -> list[Place]:
+        tag = _CATEGORY_TO_OSM_TAG.get(category)
+        if tag is None:
+            return []  # No OSM tag mapped for this category yet — not an error.
+        key, value = tag
+
+        query = f"""
+        [out:json][timeout:25];
+        node["{key}"="{value}"]
+          ({bbox.min_lat},{bbox.min_lon},{bbox.max_lat},{bbox.max_lon});
+        out body;
+        """
+        response = await self._client.post(_OVERPASS_URL, data={"data": query})
+        response.raise_for_status()
+        elements = response.json().get("elements", [])
+
+        return [
+            Place(
+                id=f"osm:node/{el['id']}",
+                name=el.get("tags", {}).get("name"),
+                category=category,
+                lat=el["lat"],
+                lon=el["lon"],
+                source="osm",
+                metadata=el.get("tags", {}),
+            )
+            for el in elements
+        ]
+
+    async def get_place_by_id(self, place_id: str) -> Place | None:
+        if not place_id.startswith("osm:node/"):
+            return None
+        node_id = place_id.removeprefix("osm:node/")
+        query = f"[out:json][timeout:25]; node({node_id}); out body;"
+        response = await self._client.post(_OVERPASS_URL, data={"data": query})
+        response.raise_for_status()
+        elements = response.json().get("elements", [])
+        if not elements:
+            return None
+        el = elements[0]
+        tags = el.get("tags", {})
+        category = next(
+            (cat for (k, v), cat in _OSM_TAG_TO_CATEGORY.items() if tags.get(k) == v),
+            PlaceCategory.OTHER,
+        )
+        return Place(
+            id=place_id, name=tags.get("name"), category=category,
+            lat=el["lat"], lon=el["lon"], source="osm", metadata=tags,
+        )
+
+    async def search_addresses(self, query: str, limit: int = 5) -> list[Address]:
+        response = await self._client.get(
+            _NOMINATIM_URL,
+            params={"q": query, "format": "json", "limit": limit},
+            headers={"User-Agent": _USER_AGENT},
+        )
+        response.raise_for_status()
+        return [
+            Address(
+                id=f"osm:{r['osm_type']}/{r['osm_id']}",
+                formatted=r["display_name"],
+                lat=float(r["lat"]),
+                lon=float(r["lon"]),
+                source="osm",
+                metadata=r,
+            )
+            for r in response.json()
+        ]
+
+    async def get_routing_graph_ref(self, bbox: BBox) -> RoutingGraphRef:
+        # Static for now — one region, one build. Once multiple regions exist,
+        # look this up from the tileset manifest written by the Week 1-2 build.
+        from config import settings
+
+        return RoutingGraphRef(
+            region_id=settings.routing_region_id, built_at=settings.routing_tiles_built_at,
+            source="osm",
+        )
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+```
+
+### `backend/mapdata/overture_source.py` — the future implementation (stub, not needed until OSM places are a measured bottleneck)
+
+Written now, unimplemented on purpose, so the interface's completeness is proven today rather than assumed. Do not fill this in speculatively — build it only when a specific enrichment feature is blocked on OSM place-data quality (e.g. inconsistent/duplicate EV charger entries in a region).
+
+```python
+# backend/mapdata/overture_source.py
+"""Overture Maps-backed MapDataSource.
+
+Not implemented until OSM place data quality is a measured bottleneck for a
+specific enrichment feature — see the Tech Stack table's note on Overture.
+Kept here, unimplemented, so `MapDataSource` is proven complete against a
+second provider's shape rather than assumed complete.
+
+Expected implementation approach when this is built: query Overture's
+released Parquet files (places/addresses/buildings themes) via `duckdb` with
+the spatial extension, filtered by bbox — no live API to call, unlike OSM's
+Overpass. `_OVERTURE_CATEGORY_TO_CATEGORY` below mirrors the structure of
+`_OSM_TAG_TO_CATEGORY` in osm_source.py; Overture's category taxonomy
+(https://docs.overturemaps.org/schema/concepts/by-theme/places/overture_categories/)
+maps far more cleanly onto PlaceCategory than OSM's free-form tags do.
+"""
+from __future__ import annotations
+
+from mapdata.base import MapDataSource
+from mapdata.models import Address, BBox, Place, PlaceCategory, RoutingGraphRef
+
+_OVERTURE_CATEGORY_TO_CATEGORY: dict[str, PlaceCategory] = {
+    "electric_vehicle_charging_station": PlaceCategory.EV_CHARGING,
+    "gas_station": PlaceCategory.FUEL,
+    "parking_lot": PlaceCategory.PARKING,
+    "park": PlaceCategory.PARK,
+    "restaurant": PlaceCategory.RESTAURANT,
+    "grocery_store": PlaceCategory.GROCERY,
+    "hotel": PlaceCategory.LODGING,
+    "bicycle_parking_station": PlaceCategory.BIKE_PARKING,
+    "bus_stop": PlaceCategory.TRANSIT_STOP,
+}
+
+
+class OvertureMapDataSource(MapDataSource):
+    async def get_places(self, category: PlaceCategory, bbox: BBox) -> list[Place]:
+        raise NotImplementedError(
+            "Build this when a specific feature is blocked on OSM place quality. "
+            "See module docstring for the intended duckdb/Parquet approach."
+        )
+
+    async def get_place_by_id(self, place_id: str) -> Place | None:
+        raise NotImplementedError
+
+    async def search_addresses(self, query: str, limit: int = 5) -> list[Address]:
+        raise NotImplementedError
+
+    async def get_routing_graph_ref(self, bbox: BBox) -> RoutingGraphRef:
+        # Overture has no mature routing-graph pipeline — this should never
+        # actually be reached; routing graphs stay OSM-only (see osm_source.py).
+        raise NotImplementedError("Routing graphs are OSM-only; use OSMMapDataSource for this.")
+```
+
+### `backend/mapdata/hybrid_source.py` — blending providers per-method
+
+This is the payoff: when Overture is worth adding, it is *composed with* OSM per-method, not swapped in wholesale. Routing graph lookups keep going to OSM; places/addresses move to whichever provider is actually better once measured.
+
+```python
+# backend/mapdata/hybrid_source.py
+"""Composes multiple MapDataSource implementations, one method at a time.
+
+Example shape for when Overture lands: keep OSM for routing (the only mature
+option) and move places/addresses to Overture (cleaner, deduped). Adjust which
+source backs which method based on what you actually measure — this class is
+a template, not a fixed policy.
+"""
+from __future__ import annotations
+
+from mapdata.base import MapDataSource
+from mapdata.models import Address, BBox, Place, PlaceCategory, RoutingGraphRef
+
+
+class HybridMapDataSource(MapDataSource):
+    def __init__(self, routing_source: MapDataSource, places_source: MapDataSource):
+        self._routing_source = routing_source   # e.g. OSMMapDataSource
+        self._places_source = places_source      # e.g. OvertureMapDataSource
+
+    async def get_places(self, category: PlaceCategory, bbox: BBox) -> list[Place]:
+        return await self._places_source.get_places(category, bbox)
+
+    async def get_place_by_id(self, place_id: str) -> Place | None:
+        return await self._places_source.get_place_by_id(place_id)
+
+    async def search_addresses(self, query: str, limit: int = 5) -> list[Address]:
+        return await self._places_source.search_addresses(query, limit)
+
+    async def get_routing_graph_ref(self, bbox: BBox) -> RoutingGraphRef:
+        return await self._routing_source.get_routing_graph_ref(bbox)
+```
+
+### `backend/mapdata/factory.py` — the single construction point
+
+```python
+# backend/mapdata/factory.py
+"""Constructs the configured MapDataSource. This is the ONLY place in the
+codebase that decides which provider(s) are active — everywhere else imports
+the interface and calls this factory, never a concrete class directly.
+"""
+from __future__ import annotations
+
+from mapdata.base import MapDataSource
+from mapdata.osm_source import OSMMapDataSource
+from mapdata.overture_source import OvertureMapDataSource
+from mapdata.hybrid_source import HybridMapDataSource
+
+
+def get_map_data_source() -> MapDataSource:
+    from config import settings
+
+    if settings.map_data_source == "osm":
+        return OSMMapDataSource()
+    if settings.map_data_source == "overture":
+        return OvertureMapDataSource()
+    if settings.map_data_source == "hybrid":
+        return HybridMapDataSource(
+            routing_source=OSMMapDataSource(), places_source=OvertureMapDataSource()
+        )
+    raise ValueError(f"Unknown map_data_source: {settings.map_data_source!r}")
+```
+
+Add to `backend/config.py`, following the existing `Settings` pattern:
+
+```python
+# backend/config.py — add alongside valhalla_url
+map_data_source: str = "osm"        # "osm" | "overture" | "hybrid" — see mapdata/factory.py
+routing_region_id: str = "dev-region"
+routing_tiles_built_at: str = ""    # populated by the Week 1-2 tile build step
+```
+
+### `backend/tests/mapdata/test_contract.py` — the suite every implementation must pass
+
+```python
+# backend/tests/mapdata/test_contract.py
+"""Shared behavioral contract for every MapDataSource implementation.
+
+Parametrize over every concrete class as it's built (OSMMapDataSource now,
+OvertureMapDataSource / HybridMapDataSource later). A new implementation is
+not safe to wire into factory.get_map_data_source() until it passes this file.
+"""
+import pytest
+
+from mapdata.models import BBox, PlaceCategory
+from mapdata.osm_source import OSMMapDataSource
+
+# Extend this list as new implementations are built:
+IMPLEMENTATIONS = [OSMMapDataSource]
+
+_EMPTY_OCEAN_BBOX = BBox(min_lat=0.0, min_lon=-30.0, max_lat=0.5, max_lon=-29.5)
+
+
+@pytest.fixture(params=IMPLEMENTATIONS)
+async def source(request):
+    impl = request.param()
+    yield impl
+    if hasattr(impl, "aclose"):
+        await impl.aclose()
+
+
+@pytest.mark.integration
+async def test_get_places_returns_empty_list_not_none(source):
+    result = await source.get_places(PlaceCategory.EV_CHARGING, _EMPTY_OCEAN_BBOX)
+    assert result == []
+
+
+@pytest.mark.integration
+async def test_search_addresses_returns_normalized_type(source):
+    results = await source.search_addresses("Arlington, TX", limit=1)
+    assert results
+    assert results[0].lat and results[0].lon
+    assert results[0].source
+
+
+@pytest.mark.integration
+async def test_get_routing_graph_ref_reports_osm_source(source):
+    ref = await source.get_routing_graph_ref(_EMPTY_OCEAN_BBOX)
+    assert ref.source == "osm"  # true regardless of implementation — see module docstrings
+```
+
+### What changes in Phase 1 Week 5–6 because of this
+
+The `geocode()` helper shown later in this document under Week 5–6 is superseded by this layer. `backend/routing/geocoder.py` should not be written as a standalone Nominatim call — route handlers call `(await get_map_data_source().search_addresses(query))` instead. Keep this in mind when you reach that section below; the code shown there is kept for reference on the API shape being replaced, not something to implement as-is.
+
+### How this plugs into later phases
+
+- **Phase 2/3 enrichment features** (EV charging waypoint insertion, delivery stop geocoding, cycling POI overlays, scenic scoring) call `get_map_data_source().get_places(...)` for POIs and never touch a provider SDK directly.
+- **The RL feature extraction** (`routing/rl_router.py`, Week 27–28) can enrich its route feature vector with place density/category counts from the same interface without knowing or caring which provider is behind it.
+- **Switching or blending providers later costs one new file + one config value**, as promised — not a rewrite of enrichment logic, API routes, or ML feature extraction.
 
 ---
 
@@ -448,49 +1043,117 @@ Valhalla uses a costing model to decide route quality. You need to build a custo
 
 #### Valhalla custom costing (Python client)
 
+**The costing translation below differs from a naive first pass in three ways, each found by probing a live Valhalla instance rather than trusting the docs alone — verify these against your own Valhalla version before relying on them:**
+
+1. **`shortest` is a boolean, not a graduated float.** Wiring "urgency" to `shortest` with values like `0.0`/`0.2`/`0.5` is broken: `0.0` is falsy (no effect), any nonzero value flips it fully on, and turning it on produces a route that's *shorter in distance but slower in time* — the opposite of what an urgent driver wants. Urgency is not tied to `shortest` here.
+2. **Out-of-range or wrong-typed costing values are silently ignored by Valhalla** — the route request still succeeds, just without the intended effect (e.g. `use_highways=5.0` behaves identically to not setting it at all, no error). Every value emitted below is therefore clamped to its valid range, so a preference can never silently no-op.
+3. **`auto` costing has no left-turn-specific penalty.** `maneuver_penalty` penalizes *all* turns, not just left ones. `avoid_left_turns` is therefore only a coarse approximation in Phase 1 (fewer total turns correlates weakly with fewer left turns); precise left-turn avoidance needs a custom C++ costing model — later work, not a Phase 1 gap to "fix" by digging further into `costing_options`.
+
 ```python
 # backend/routing/valhalla_client.py
+"""Valhalla routing client + custom costing translation.
 
-import httpx
+This module is the single bridge between *user preferences* and the routing
+engine's cost model. In Phase 1 the preferences are produced by rule-based
+logic (declared dislikes, the pre-trip "are you in a hurry?" question). In
+Phase 3 the exact same UserRoutingPrefs struct will instead be produced by
+the RL policy — a small per-user preference vector decoded into these weights.
+Keeping that seam clean and stable now is what lets the learned model plug in
+later without touching the routing plumbing.
+"""
+from __future__ import annotations
+
 import json
 from dataclasses import dataclass
 from typing import Optional
 
+import httpx
+
+_DEFAULT_MANEUVER_PENALTY = 5.0   # seconds, Valhalla default
+_MAX_MANEUVER_PENALTY = 300.0     # empirically enough to reshape local routes
+_DEFAULT_LIVING_STREETS = 0.1     # Valhalla default use_living_streets
+
+
+def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
 @dataclass
 class UserRoutingPrefs:
     """User preference weights injected into Valhalla's cost model.
-    Starts as rule-based. RL replaces these with learned weights later."""
-    avoid_highways: float = 0.0       # 0.0 = no penalty, 1.0 = avoid entirely
-    avoid_tolls: float = 0.0
-    prefer_scenic: float = 0.0
-    avoid_left_turns: float = 0.0
-    urgency: float = 0.5              # 0.0 = leisurely, 1.0 = fastest possible
+
+    Every field is a 0.0-1.0 intensity. 0.0 means "no opinion / don't apply",
+    1.0 means "apply as strongly as the engine allows". This is the struct
+    the RL policy will emit in Phase 3.
+    """
+    avoid_highways: float = 0.0    # 1.0 => avoid highways as much as possible
+    avoid_tolls: float = 0.0       # 1.0 => avoid toll roads
+    prefer_scenic: float = 0.0     # 1.0 => favour local/living streets over arterials
+    avoid_left_turns: float = 0.0  # 1.0 => penalise turns (coarse proxy, see above)
+    urgency: float = 0.5           # 0.0 leisurely ... 1.0 fastest-possible
+
 
 class ValhallaRouter:
-    def __init__(self, base_url: str):
-        self.base_url = base_url
-        self.client = httpx.AsyncClient(timeout=30.0)
+    """Async client for a Valhalla routing service.
+
+    Owns an httpx.AsyncClient by default, or accepts a shared one (preferred
+    inside a long-lived FastAPI app so connections are pooled). Use as an
+    async context manager, or call aclose() on shutdown.
+    """
+
+    def __init__(self, base_url: str, client: Optional[httpx.AsyncClient] = None, timeout: float = 30.0):
+        self.base_url = base_url.rstrip("/")
+        self._client = client or httpx.AsyncClient(timeout=timeout)
+        self._owns_client = client is None
+
+    async def __aenter__(self) -> "ValhallaRouter":
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
 
     def _build_costing_options(self, prefs: UserRoutingPrefs) -> dict:
-        """Translate user preferences into Valhalla costing parameters.
-        
-        This function is the bridge between user preferences and routing.
-        RL will eventually generate these weights instead of rule-based logic.
+        """Translate user preferences into Valhalla `auto` costing parameters.
+
+        This is the RL injection point. All outputs are clamped to ranges the
+        engine honours (see point 2 above).
         """
-        # Use_highways: 0.0 = avoid, 1.0 = prefer. Valhalla's scale.
-        use_highways = 1.0 - (prefs.avoid_highways * 0.9)
-        use_tolls = 1.0 - (prefs.avoid_tolls * 0.9)
-        
-        # Urgency shifts the cost function toward time vs. distance
-        # High urgency = weight time heavily; low urgency = consider alternatives
-        shortest = 0.0 if prefs.urgency > 0.7 else (0.5 if prefs.urgency < 0.3 else 0.2)
+        avoid_highways = _clamp(prefs.avoid_highways)
+        avoid_tolls = _clamp(prefs.avoid_tolls)
+        prefer_scenic = _clamp(prefs.prefer_scenic)
+        avoid_left_turns = _clamp(prefs.avoid_left_turns)
+        urgency = _clamp(prefs.urgency)
+
+        # use_highways: 0.0 avoids, 1.0 prefers. Start from the explicit
+        # highway aversion, let a scenic preference push it further down, and
+        # let high urgency pull it back up (a rushed driver tolerates a
+        # highway even if mildly disliked).
+        use_highways = 1.0 - 0.9 * avoid_highways
+        use_highways -= 0.5 * prefer_scenic
+        use_highways += 0.3 * (urgency - 0.5)  # +/-0.15 nudge around neutral
+        use_highways = _clamp(use_highways)
+
+        use_tolls = _clamp(1.0 - 0.9 * avoid_tolls)
+
+        # Scenic routing leans on local/living streets, which Valhalla
+        # otherwise keeps rare (default 0.1).
+        use_living_streets = _clamp(_DEFAULT_LIVING_STREETS + 0.6 * prefer_scenic)
+
+        maneuver_penalty = _DEFAULT_MANEUVER_PENALTY + (
+            _MAX_MANEUVER_PENALTY - _DEFAULT_MANEUVER_PENALTY
+        ) * avoid_left_turns
 
         return {
             "auto": {
                 "use_highways": use_highways,
                 "use_tolls": use_tolls,
-                "shortest": shortest,
-                "top_speed": 130,       # km/h, adjust per region
+                "use_living_streets": use_living_streets,
+                "maneuver_penalty": maneuver_penalty,
+                "shortest": False,  # see point 1 above — never derived from prefs
             }
         }
 
@@ -498,9 +1161,9 @@ class ValhallaRouter:
         self,
         origin: tuple[float, float],           # (lat, lon)
         destination: tuple[float, float],      # (lat, lon)
-        waypoints: list[tuple[float, float]] = None,
-        prefs: UserRoutingPrefs = None,
-        alternatives: int = 3                  # Always fetch alternatives for RL data
+        waypoints: Optional[list[tuple[float, float]]] = None,
+        prefs: Optional[UserRoutingPrefs] = None,
+        alternatives: int = 3,                 # always request alternates for RL training data
     ) -> dict:
         if prefs is None:
             prefs = UserRoutingPrefs()
@@ -515,40 +1178,43 @@ class ValhallaRouter:
             "costing": "auto",
             "costing_options": self._build_costing_options(prefs),
             "alternates": alternatives,
-            "directions_options": {
-                "units": "miles",
-                "language": "en-US",
-                "narrative": True
-            }
+            "directions_options": {"units": "miles", "language": "en-US", "narrative": True},
         }
 
-        response = await self.client.post(
-            f"{self.base_url}/route",
-            content=json.dumps(payload),
-            headers={"Content-Type": "application/json"}
+        response = await self._client.post(
+            f"{self.base_url}/route", content=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
         )
         response.raise_for_status()
         return response.json()
 
-    async def get_isochrone(
-        self,
-        location: tuple[float, float],
-        minutes: list[int] = [5, 10, 15]
-    ) -> dict:
-        """Reachability polygon — useful for 'what can I reach in X minutes'."""
+    async def get_isochrone(self, location: tuple[float, float], minutes: Optional[list[int]] = None) -> dict:
+        """Reachability polygon — 'what can I reach in X minutes'."""
+        if minutes is None:
+            minutes = [5, 10, 15]
         payload = {
             "locations": [{"lat": location[0], "lon": location[1]}],
             "costing": "auto",
             "contours": [{"time": m} for m in minutes],
-            "polygons": True
+            "polygons": True,
         }
-        response = await self.client.post(
-            f"{self.base_url}/isochrone",
-            content=json.dumps(payload)
+        response = await self._client.post(
+            f"{self.base_url}/isochrone", content=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
         )
         response.raise_for_status()
         return response.json()
+
+
+def get_router(client: Optional[httpx.AsyncClient] = None) -> ValhallaRouter:
+    """Construct a router pointed at the configured Valhalla service."""
+    from config import settings
+    return ValhallaRouter(settings.valhalla_url, client=client)
 ```
+
+Add `valhalla_url` to `backend/config.py`'s `Settings` (see Step 5's note on `localhost` vs. container hostnames — the default should be `http://localhost:8002`, not the Docker service name, so this works when FastAPI runs directly on the host during development).
+
+**Verification:** unit-test `_build_costing_options` directly (pure function, no network) — assert `avoid_highways=1.0` drives `use_highways` down, `prefer_scenic=1.0` raises `use_living_streets`, out-of-range inputs stay clamped to `[0, 1]`. Then one live integration test against a running Valhalla instance confirming `avoid_highways=1.0` actually changes the returned route's time/length — skip it automatically if Valhalla isn't reachable so the suite stays green without the routing engine running.
 
 ---
 
@@ -659,30 +1325,23 @@ POST   /api/v1/feedback/{trip_id}      — Submit post-trip text feedback
 GET    /api/v1/routing/search          — Geocoding (place name → lat/lon)
 ```
 
-For geocoding (turning "Austin, TX" into coordinates), use **Nominatim** — the OSM geocoder. Self-host it or hit the public endpoint for development.
+For geocoding (turning "Austin, TX" into coordinates), do **not** call Nominatim directly from this route handler. Use the `MapDataSource` interface built in [Map Data Abstraction Layer](#map-data-abstraction-layer) — `OSMMapDataSource.search_addresses()` already wraps Nominatim, and going through the interface here is what makes a later Overture/hybrid swap free.
 
 ```python
-# backend/routing/geocoder.py
+# backend/api/routes/routing.py (search endpoint)
 
-import httpx
+from mapdata.factory import get_map_data_source
 
-async def geocode(query: str) -> dict | None:
-    """Convert place name or address to lat/lon using OSM Nominatim."""
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={"q": query, "format": "json", "limit": 5},
-            headers={"User-Agent": "AdaptiveMapApp/0.1 contact@yourapp.com"}
-        )
-        results = response.json()
-        if not results:
-            return None
-        return {
-            "lat": float(results[0]["lat"]),
-            "lon": float(results[0]["lon"]),
-            "display_name": results[0]["display_name"]
-        }
+@router.get("/search")
+async def search_place(q: str):
+    source = get_map_data_source()
+    results = await source.search_addresses(q, limit=5)
+    if not results:
+        return {"results": []}
+    return {"results": [{"lat": r.lat, "lon": r.lon, "display_name": r.formatted} for r in results]}
 ```
+
+There is no separate `backend/routing/geocoder.py` — geocoding is a `MapDataSource` method, not a standalone routing concern.
 
 ---
 
@@ -2311,11 +2970,15 @@ Use this as your weekly check-in. Do not move to the next phase until the curren
 - [ ] Docker Compose starts all services without errors
 - [ ] OSM data downloaded and Valhalla tiles built for your target region
 - [ ] PostGIS schema migrated with all tables created
+- [ ] `MapDataSource` interface (`backend/mapdata/base.py`) and `Place`/`Address`/`BBox`/`RoutingGraphRef` models exist
+- [ ] `OSMMapDataSource` implements the interface and passes `backend/tests/mapdata/test_contract.py`
+- [ ] `get_map_data_source()` factory reads `settings.map_data_source` and is the only construction point used by API code
+- [ ] No `httpx`/`requests` calls to Overpass/Nominatim exist outside `backend/mapdata/`
 - [ ] GET `/api/v1/routing/route` returns a valid Valhalla route
 - [ ] Route alternatives (3 options) return correctly
 - [ ] Trips are saved to the database on every route request
 - [ ] MapLibre GL renders a route on the map in the browser
-- [ ] User can type a place name and get coordinates (geocoding works)
+- [ ] User can type a place name and get coordinates via `get_map_data_source().search_addresses()` (geocoding works)
 - [ ] User preferences (avoid highways, avoid tolls) change the returned route
 - [ ] Basic turn-by-turn instruction list displays in sidebar
 

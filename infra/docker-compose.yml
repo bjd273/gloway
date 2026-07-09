@@ -26,6 +26,14 @@ services:
     environment:
       - use_tiles_ignore_pbf=True
 
+  martin:
+    image: ghcr.io/maplibre/martin:latest
+    volumes:
+      - ./data/tiles:/tiles
+    ports:
+      - "3001:3000"
+    command: --listen-addresses 0.0.0.0:3000 /tiles
+
   qdrant:
     image: qdrant/qdrant:latest
     ports:

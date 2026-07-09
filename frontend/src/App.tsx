@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import maplibregl from 'maplibre-gl'
 import 'maplibre-gl/dist/maplibre-gl.css'
 import polyline from '@mapbox/polyline'
+import mapStyle from './mapStyle.json'
 import './index.css'
 
 function App() {
@@ -20,12 +21,29 @@ function App() {
   useEffect(() => {
     if (map.current || !mapContainer.current) return
 
+    // MapLibre's tile fetches run inside a Blob-URL worker, which can't
+    // resolve relative tile URL templates — they must be absolute. The style
+    // JSON itself stays environment-agnostic; we resolve against the current
+    // origin here so this works unmodified in dev, staging, and prod.
+    const style = structuredClone(mapStyle) as maplibregl.StyleSpecification
+    const tileSource = style.sources.openmaptiles as maplibregl.VectorSourceSpecification
+    tileSource.tiles = tileSource.tiles?.map((t) => `${window.location.origin}${t}`)
+
     map.current = new maplibregl.Map({
       container: mapContainer.current,
-      style: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
+      style,
       center: [-97.11, 32.735],
-      zoom: 13,
+      zoom: 15,
+      pitch: 55,      // tilt the camera so extruded buildings are visible
+      bearing: -17,
+      antialias: true, // smoother edges on 3D building extrusions
     })
+
+    // Let users tilt/rotate to explore the 3D view.
+    map.current.addControl(
+      new maplibregl.NavigationControl({ visualizePitch: true }),
+      'top-right',
+    )
 
     const originEl = document.createElement('div')
     originEl.className = 'marker-origin'
