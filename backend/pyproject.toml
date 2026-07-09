@@ -23,7 +23,8 @@ dependencies = [
     "geopandas>=0.14.3",
     "shapely>=2.0.3",
     "anthropic>=0.21.3",
-    "openai>=1.14.2"
+    "openai>=1.14.2",
+    "greenlet (>=3.5.3,<4.0.0)"
 ]
 
 [tool.poetry]
