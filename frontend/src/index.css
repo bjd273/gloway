@@ -785,6 +785,18 @@ body {
 }
 
 /* --- navigation controls --- */
+.trip-drivemode {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+/* The two mode chips split the row evenly so it reads as one segmented
+   control (reuses .trip-chip / .trip-chip--active for styling). */
+.trip-drivemode .trip-chip {
+  flex: 1;
+}
+
 .trip-actions {
   display: flex;
   align-items: center;

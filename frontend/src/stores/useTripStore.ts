@@ -8,13 +8,27 @@
 import { create } from 'zustand'
 
 import { FriendlyError, getRoute, type ParsedRoute, type TravelMode } from '../lib/api'
-import { DriveController } from '../lib/navigation'
+import { DriveController, type DriveMode, resolveDriveMode } from '../lib/navigation'
 import { inRegion } from '../lib/region'
 import { useUserStore } from './useUserStore'
 
 // The active drive's streaming controller. Non-serializable, so it lives
 // outside zustand state — the store just starts/stops it.
 let driveController: DriveController | null = null
+
+// Persisted drive-mode choice (Live GPS vs Simulated). A device habit, not
+// routing data — same manual-localStorage pattern as useVoiceStore. Order of
+// precedence for the initial value: an explicit ?sim=1 (dev override) wins,
+// then the user's saved toggle, then the environment default from
+// resolveDriveMode (real when geolocation exists, sim otherwise).
+const DRIVE_MODE_KEY = 'gloway:driveMode'
+
+function initialDriveMode(): DriveMode {
+  if (new URLSearchParams(window.location.search).get('sim') === '1') return 'sim'
+  const stored = localStorage.getItem(DRIVE_MODE_KEY)
+  if (stored === 'real' || stored === 'sim') return stored
+  return resolveDriveMode()
+}
 
 // Set by the in-drive voice loop before a command that reroutes, so the drive
 // resumes on the new route instead of silently ending. Consumed (and reset)
@@ -45,6 +59,9 @@ interface TripState {
   declaredIntent: string | null
   /** Travel mode — car (auto), bike, or walk. Re-routes on change. */
   mode: TravelMode
+  /** How a drive is sourced: 'real' = device GPS (watchPosition), 'sim' =
+   * simulated progress along the route (dev/demo, off-region). Persisted. */
+  driveMode: DriveMode
   /** ACTIVE_NAVIGATION: streaming GPS along the selected route. */
   navPhase: NavPhase
   /** Live position during navigation (the moving puck). */
@@ -70,6 +87,8 @@ interface TripState {
   removeStop(index: number): void
   clearStops(): void
   setMode(mode: TravelMode): void
+  /** Switch how the next drive is sourced (Live GPS vs Simulated). */
+  setDriveMode(mode: DriveMode): void
   /** Begin streaming the drive along the selected route. */
   startNavigation(): void
   /** Stop streaming (manual "Arrive" or trip cleared). */
@@ -159,6 +178,7 @@ export const useTripStore = create<TripState>((set, get) => {
     errorMessage: null,
     declaredIntent: null,
     mode: 'auto',
+    driveMode: initialDriveMode(),
     navPhase: 'idle',
     currentPosition: null,
     navProgress: 0,
@@ -227,6 +247,12 @@ export const useTripStore = create<TripState>((set, get) => {
       get().refreshRoute()
     },
 
+    setDriveMode(mode) {
+      if (get().driveMode === mode) return
+      localStorage.setItem(DRIVE_MODE_KEY, mode)
+      set({ driveMode: mode })
+    },
+
     startNavigation() {
       const { routes, selectedIndex, tripId, origin, navPhase } = get()
       if (navPhase === 'navigating' || !tripId) return
@@ -248,7 +274,8 @@ export const useTripStore = create<TripState>((set, get) => {
           driveController = null
           set({ navPhase: 'idle', currentPosition: null, navProgress: 0, errorMessage: message })
         },
-      })
+      },
+      get().driveMode)
       driveController.start()
       // Note on reroutes: in real mode a post-reroute restart naturally
       // resumes from the live GPS fix (the device is the source of truth) and

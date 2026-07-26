@@ -38,6 +38,8 @@ export function TripPanel() {
   const tripId = useTripStore((s) => s.tripId)
   const stops = useTripStore((s) => s.stops)
   const mode = useTripStore((s) => s.mode)
+  const driveMode = useTripStore((s) => s.driveMode)
+  const setDriveMode = useTripStore((s) => s.setDriveMode)
   const navPhase = useTripStore((s) => s.navPhase)
   const navProgress = useTripStore((s) => s.navProgress)
   const arrived = useTripStore((s) => s.arrived)
@@ -233,14 +235,34 @@ export function TripPanel() {
               <NavVoice />
             </>
           ) : (
-            <div className="trip-actions">
-              <button className="trip-start" onClick={startNavigation}>
-                Start drive
-              </button>
-              <button className="trip-done" onClick={startWrapUp}>
-                Done driving?
-              </button>
-            </div>
+            <>
+              <div className="trip-drivemode" role="group" aria-label="How to drive">
+                <button
+                  className={'trip-chip' + (driveMode === 'real' ? ' trip-chip--active' : '')}
+                  aria-pressed={driveMode === 'real'}
+                  title="Record your real drive using your phone's GPS"
+                  onClick={() => setDriveMode('real')}
+                >
+                  🛰️ Live GPS
+                </button>
+                <button
+                  className={'trip-chip' + (driveMode === 'sim' ? ' trip-chip--active' : '')}
+                  aria-pressed={driveMode === 'sim'}
+                  title="Simulate driving the route (for testing off the road)"
+                  onClick={() => setDriveMode('sim')}
+                >
+                  ▶︎ Simulate
+                </button>
+              </div>
+              <div className="trip-actions">
+                <button className="trip-start" onClick={startNavigation}>
+                  Start drive
+                </button>
+                <button className="trip-done" onClick={startWrapUp}>
+                  Done driving?
+                </button>
+              </div>
+            </>
           )}
 
           {wrappingUp && (debriefStatus !== 'off' ? (
