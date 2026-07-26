@@ -26,6 +26,7 @@ class PlaceCategory(str, Enum):
     FUEL = "fuel"
     PARKING = "parking"
     PARK = "park"
+    CAFE = "cafe"
     RESTAURANT = "restaurant"
     GROCERY = "grocery"
     LODGING = "lodging"

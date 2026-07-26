@@ -1,0 +1,245 @@
+# Data Flow & Sequence Diagrams
+
+## 1. Route calculation
+
+The core loop: pick two points, get a route, and have that request itself become training data for later.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant FE as Frontend (useTripStore)
+    participant API as POST /api/v1/routing/route
+    participant DB as Postgres
+    participant VH as Valhalla
+
+    U->>FE: drop/search origin & destination
+    FE->>API: RouteRequest {origin, dest, user_id?, declared_intent?, waypoints, mode}
+    API->>DB: SELECT user_preferences WHERE user_id
+    DB-->>API: avoid_highways / avoid_tolls / prefer_scenic / avoid_left_turns
+    Note over API: _load_prefs() builds UserRoutingPrefs;<br/>declared_intent overrides urgency (hurry=1.0, explore=0.2)
+    API->>API: _build_costing_options(prefs) — clamped 0..1 values
+    API->>VH: POST /route {locations, costing, costing_options, alternates:3}
+    VH-->>API: {trip: {...}, alternates: [...]}
+    API->>DB: INSERT trips (origin, destination, suggested_route=full Valhalla response, context)
+    API-->>FE: RouteResponse {trip_id, routes[], recommended_index, estimated_minutes}
+    FE->>FE: parseTrip() decodes each leg's polyline6 shape into [lng,lat] coords + steps
+    FE->>U: render primary + alternate routes on the map
+```
+
+Every route request is persisted as a `trips` row **whether or not** anyone consumes it downstream yet — this is the raw material the Phase 3 RL trainer will eventually read (`suggested_route`, `context`, later `actual_path_taken` and `reward_value`). See `api/routes/routing.py`'s module docstring.
+
+If Valhalla returns a `4xx` (point outside the tiled region, unroutable), the backend forwards that status with Valhalla's error detail rather than a blind `500`; a `503` is returned if Valhalla is unreachable at all. The frontend maps both into one of two fixed, friendly strings (`ENGINE_DOWN_MESSAGE` / `OUT_OF_AREA_MESSAGE`) — see `lib/api.ts::getRoute`.
+
+## 2. Geocoding / place search
+
+```mermaid
+sequenceDiagram
+    participant FE as Frontend (PromptBar)
+    participant API as GET /api/v1/routing/search
+    participant Factory as mapdata.factory
+    participant Hybrid as HybridMapDataSource
+    participant Overture as OvertureMapDataSource (duckdb)
+    participant OSM as OSMMapDataSource (Nominatim)
+
+    FE->>API: GET /search?q=...
+    API->>Factory: get_map_data_source()
+    Factory->>Hybrid: constructed per settings.map_data_source
+    API->>Hybrid: search_addresses(q, limit=5)
+    par concurrently (asyncio.gather)
+        Hybrid->>Overture: search_addresses(q, limit)
+        Hybrid->>OSM: search_addresses(q, limit)
+    end
+    Overture-->>Hybrid: place-name matches (parquet ILIKE)
+    OSM-->>Hybrid: Nominatim address matches
+    Note over Hybrid: de-dupe within ~50m,<br/>Overture copy wins (cleaner name)
+    Hybrid-->>API: merged Address[]
+    API-->>FE: {results: [{lat, lon, display_name}]}
+```
+
+Either branch failing (`return_exceptions=True` in the `asyncio.gather`) degrades to just the other's results rather than failing the whole search — see `hybrid_source.py`.
+
+## 3. Pre-trip conversation
+
+```mermaid
+sequenceDiagram
+    participant FE as Frontend (useConvoStore)
+    participant Open as POST .../conversation/open
+    participant Reply as POST .../conversation/reply
+    participant LLM as Gemini (via LLMClient)
+    participant DB as Postgres
+
+    FE->>Open: (after a route is drawn)
+    Open->>DB: load trip, journey profile, preferences
+    Open->>LLM: complete(PRE_JOURNEY_SYSTEM, profile+trip context)
+    LLM-->>Open: one short contextual opener (<=30 words)
+    Open->>DB: INSERT trip_conversations {messages:[opener]}
+    Open-->>FE: {conversation_id, messages}
+
+    FE->>Reply: {text, route_options: [{index, minutes, selected}, ...]}
+    Reply->>LLM: complete(_REPLY_SYSTEM, conversation history + user text), json_mode
+    LLM-->>Reply: JSON {intent, preference_updates, switch_to_route,<br/>add_stop, remove_stops, set_destination, travel_mode, confidence}
+    alt add_stop present
+        Reply->>Reply: _find_stop(): bbox around O-D, nearest candidate to midpoint<br/>via mapdata.factory (place-name search or category lookup)
+    end
+    alt preference_updates present AND confidence high enough AND trip has a user_id
+        Reply->>DB: UPDATE user_preferences
+    end
+    Reply->>DB: append both turns to trip_conversations.messages
+    Reply-->>FE: ReplyResponse {message, intent, preferences?, switch_to_route?, stop?, ...}
+    FE->>FE: applyReplyResult() — reroute / switch / add stop / change mode / go home
+```
+
+Key extraction rules baked into the `_REPLY_SYSTEM` prompt (`ml/llm/conversation.py`): a one-off "avoid the highway *today*" is `intent`, not a durable `preference_updates` entry; only a clearly-stated durable preference (`"I hate highways"`) writes to `user_preferences`. Extractions below `CONFIDENCE_FLOOR = 0.5` are dropped for preferences (but `intent` always passes through — a wrong one-trip guess is cheap to undo, a wrongly-persisted preference isn't).
+
+## 4. In-drive voice (WebSocket)
+
+The same reply-interpretation contract as above, but over a persistent connection held open for the whole drive, with live navigation context riding along each utterance.
+
+```mermaid
+sequenceDiagram
+    participant FE as Frontend (NavVoice)
+    participant WS as WS /api/v1/trips/{id}/voice
+    participant LLM as Gemini
+    participant DB as Postgres
+
+    FE->>WS: connect (once, at navigation start)
+    WS->>LLM: get_llm_client() — closes 1011 immediately if unconfigured
+    loop each utterance
+        FE->>WS: {type:"utterance", mime, audio_b64, nav:{destLabel, progress, minutesRemaining, nextManeuver}, routeOptions}
+        WS->>LLM: transcribe(audio, mime)
+        LLM-->>WS: text (empty string = no speech heard)
+        WS-->>FE: {type:"transcript", text}
+        opt text non-empty
+            WS->>DB: load trip + latest conversation
+            WS->>LLM: interpret_navigation_reply(history, text, nav_context, route_options)
+            LLM-->>WS: same structured shape as the HTTP reply path
+            opt add_stop present
+                WS->>WS: _find_stop() (same helper conversation.py uses)
+            end
+            WS->>DB: persist prefs (if any) + append turns (best-effort — never breaks the drive)
+            WS-->>FE: {type:"reply", text, action:{message, intent, preferences, switch_to_route, stop, stops_cleared, set_destination, travel_mode}}
+            FE->>FE: applyReplyResult(action, {reArmDrive:true}) — same parser as pre-trip
+        end
+    end
+```
+
+`action`'s shape is byte-for-byte the same as the HTTP `ReplyResponse` (snake_case field names preserved over the wire) specifically so the frontend's `applyReplyResult()` handles both without a second parser. The one difference: `reArmDrive: true` tells the trip store to restart the (simulated) drive on the newly-computed route after any reroute, so a mid-drive "take me home" doesn't silently end navigation.
+
+## 5. GPS breadcrumbs during a drive
+
+```mermaid
+sequenceDiagram
+    participant DC as DriveController (frontend)
+    participant API as POST .../trips/{id}/gps-update
+    participant DB as Postgres
+
+    loop every 800ms
+        DC->>DC: tick() — advance synthetic position, buffer point
+    end
+    loop every 3000ms
+        DC->>API: flush() — batched points [{lat, lon, timestamp}, ...]
+        API->>DB: UPDATE trips SET actual_path_taken =<br/>coalesce(actual_path_taken,'[]') || :new_points
+        Note over API,DB: Atomic jsonb append at the DB.<br/>Two concurrent flushes serialize under<br/>the row lock instead of one clobbering<br/>the other (the old read-modify-write bug).
+    end
+```
+
+See [ADR: atomic GPS append](decisions.md#atomic-jsonb-append-for-gps-breadcrumbs-not-read-modify-write) for why this is a single `UPDATE ... = col || :new` rather than reading the array into Python, appending, and writing it back.
+
+## 6. Post-trip debrief → reward signal
+
+This is the pipeline that eventually feeds RL training: a driver's reaction to the trip becomes a numeric `reward_value` on the `trips` row.
+
+```mermaid
+sequenceDiagram
+    participant FE as Frontend (useDebriefStore)
+    participant Complete as POST .../trips/{id}/complete
+    participant Open as POST .../debrief/open
+    participant Reply as POST .../debrief/reply
+    participant LLM as Gemini
+    participant DB as Postgres
+
+    FE->>Complete: {duration_minutes?, deviated?}
+    Complete->>DB: trip.completed_at = now(); reward_value = 0.0 (neutral default)<br/>implicit_signals.reward_source = "default_neutral"
+    Note over Complete: Idempotent — a retried tap returns the<br/>existing completed_at rather than overwriting.
+
+    FE->>Open: (drive ended, "how was it?")
+    Open->>LLM: generate_debrief_question(journey, {dest_label})
+    LLM-->>Open: one short question
+    Open-->>FE: {message}
+
+    FE->>Reply: {text: driver's reaction}
+    Reply->>LLM: interpret_debrief(question, text)
+    LLM-->>Reply: {reward_delta, confidence, preference_updates, assistant_reply}
+    Reply->>DB: trip.reward_value = reward_delta<br/>implicit_signals.debrief = {...}; reward_source = "debrief"
+    opt preference_updates present
+        Reply->>DB: UPDATE user_preferences
+    end
+    Reply-->>FE: {message, reward, preferences?}
+```
+
+Every completed trip gets a `reward_value` — `0.0` by default the moment `/complete` is called, overwritten by the real `reward_delta` if the driver actually finishes the debrief. This guarantees the Phase 3 RL trainer always has a reward to read, never a `NULL`, regardless of how engaged the driver was.
+
+## Schema (entity relationships)
+
+```mermaid
+erDiagram
+    users ||--o| user_preferences : has
+    users ||--o| user_journey_profiles : has
+    users ||--o{ trips : makes
+    trips ||--o{ trip_conversations : has
+
+    users {
+        uuid id PK
+        string email
+        bool onboarding_completed
+    }
+    user_preferences {
+        uuid user_id PK_FK
+        bool avoid_highways
+        bool avoid_tolls
+        bool avoid_left_turns
+        bool prefer_scenic
+        int max_acceptable_detour_minutes
+        float_array preference_vector "unused today — Phase 3 RL input"
+    }
+    user_journey_profiles {
+        uuid user_id PK_FK
+        text_array typical_use_cases
+        text_array stated_dislikes
+        geography home_location
+        geography work_location
+        jsonb known_regular_routes "unused today"
+        jsonb driving_persona "unused today"
+        string preferred_convo_style
+    }
+    trips {
+        uuid id PK
+        uuid user_id FK "nullable — anonymous trips allowed"
+        geography origin
+        geography destination
+        jsonb suggested_route
+        jsonb actual_path_taken "GPS breadcrumbs, appended live"
+        jsonb context
+        jsonb implicit_signals
+        text explicit_feedback
+        float reward_value
+    }
+    trip_conversations {
+        uuid id PK
+        uuid trip_id FK
+        uuid user_id FK "nullable"
+        jsonb messages "role/content/timestamp, phase-tagged"
+        jsonb preference_updates_extracted
+    }
+    road_segments {
+        bigint id PK
+        bigint osm_way_id
+        geography geom "LINESTRING, junction-to-junction"
+        string highway_type
+        int speed_limit_kph
+        int lanes
+        bool one_way
+    }
+```
+
+`road_segments` has no foreign key to anything else — it's populated wholesale from an OSM extract by `backend/scripts/ingest_road_segments.py` / `ml/gnn/ingest.py`, and consumed only by `ml/gnn/graph_builder.py` (not yet by any API route).

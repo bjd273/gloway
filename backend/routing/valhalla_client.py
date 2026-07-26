@@ -139,6 +139,7 @@ class ValhallaRouter:
         waypoints: Optional[list[tuple[float, float]]] = None,
         prefs: Optional[UserRoutingPrefs] = None,
         alternatives: int = 3,                 # always request alternates for RL training data
+        costing: str = "auto",                 # "auto" | "bicycle" | "pedestrian"
     ) -> dict:
         if prefs is None:
             prefs = UserRoutingPrefs()
@@ -150,8 +151,7 @@ class ValhallaRouter:
 
         payload = {
             "locations": locations,
-            "costing": "auto",
-            "costing_options": self._build_costing_options(prefs),
+            "costing": costing,
             "alternates": alternatives,
             "directions_options": {
                 "units": "miles",
@@ -159,6 +159,12 @@ class ValhallaRouter:
                 "narrative": True,
             },
         }
+        # The preference->cost translation is auto-specific (use_highways,
+        # use_tolls, ...); bike/walk use Valhalla's defaults. This keeps the RL
+        # injection seam intact for the primary mode without inventing
+        # bike/pedestrian costing mappings that don't exist yet.
+        if costing == "auto":
+            payload["costing_options"] = self._build_costing_options(prefs)
 
         response = await self._client.post(
             f"{self.base_url}/route",

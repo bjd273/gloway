@@ -12,6 +12,7 @@ from sqlalchemy import (
     String,
     TIMESTAMP,
     Text,
+    Time,
     text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -47,6 +48,82 @@ class UserPreference(Base):
     preference_vector: Mapped[list | None] = mapped_column(ARRAY(Float), nullable=True)
     updated_at: Mapped[object] = mapped_column(
         TIMESTAMP(timezone=True), server_default=text("NOW()")
+    )
+
+
+class UserJourneyProfile(Base):
+    """Phase 2 profile: onboarding facts + patterns learned over time.
+
+    This is what the LLM conversation layer reads before every trip (and what
+    Phase 3's similar-user bootstrapping queries by home/work proximity —
+    hence the spatial indexes). Distinct from UserPreference, which holds the
+    routing weights injected into Valhalla costing.
+    """
+
+    __tablename__ = "user_journey_profiles"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+
+    # From onboarding
+    typical_use_cases: Mapped[list | None] = mapped_column(ARRAY(Text), nullable=True)
+    stated_dislikes: Mapped[list | None] = mapped_column(ARRAY(Text), nullable=True)
+    home_location = mapped_column(
+        Geography(geometry_type="POINT", srid=4326, spatial_index=True), nullable=True
+    )
+    work_location = mapped_column(
+        Geography(geometry_type="POINT", srid=4326, spatial_index=True), nullable=True
+    )
+
+    # Learned over time
+    known_regular_routes: Mapped[list] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb")
+    )
+    driving_persona: Mapped[dict] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))
+    preferred_convo_style: Mapped[str] = mapped_column(String(20), server_default=text("'brief'"))
+
+    # Context patterns (learned)
+    morning_routine_start_time: Mapped[object | None] = mapped_column(Time, nullable=True)
+    typical_commute_duration_mins: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    updated_at: Mapped[object] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("NOW()")
+    )
+
+
+class TripConversation(Base):
+    """Per-trip conversation history — LLM context + extraction target."""
+
+    __tablename__ = "trip_conversations"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    trip_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("trips.id"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    messages: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    # A *list* of per-reply extractions, appended in order — not a single dict.
+    # It was a dict originally, overwritten on every reply, which silently
+    # discarded everything but the last turn. The `switch_to_route` field in
+    # particular is a pairwise preference label ("shown these options, chose
+    # #2") and the strongest training signal the conversation produces, so it
+    # has to survive every turn. JSONB stores arrays natively, so widening this
+    # needs no migration; pre-existing rows are NULL and stay NULL.
+    preference_updates_extracted: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[object] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=text("NOW()")
+    )
+
+    __table_args__ = (
+        Index("idx_trip_conversations_trip_id", "trip_id"),
+        Index("idx_trip_conversations_user_id", "user_id"),
     )
 
 

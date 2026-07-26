@@ -45,13 +45,13 @@
 |---|---|---|
 | Data abstraction | `backend/mapdata/` — a `MapDataSource` interface | Every enrichment feature (EV charging, delivery, cycling, scenic scoring, geocoding) is written against this interface, never against a specific provider. See [Map Data Abstraction Layer](#map-data-abstraction-layer). |
 | Places/POI source (v1) | OpenStreetMap via Overpass API or self-hosted extract | Free, matches the routing graph data, richest tagging for routing-relevant attributes (access rules, conditional restrictions). |
-| Places/POI source (future, optional) | [Overture Maps](https://overturemaps.org) | Cleaner, more consistent schema and better deduped buildings/places/addresses. Bolted on later as a second `MapDataSource` implementation, or blended via a `HybridMapDataSource` — zero rework to callers because they only ever see the interface. Do not adopt until OSM place-data quality is an actual measured bottleneck. |
+| Places/POI source (future, optional) | [Overture Maps](https://overturemaps.org) | Cleaner, more consistent schema and better deduped buildings/places/addresses. Bolted on later as a second `MapDataSource` implementation, or blended via a `HybridMapDataSource` — zero rework to callers because they only ever see the interface. Do not adopt until OSM place-data quality is an actual measured bottleneck. **Built (July 2026): OSM place coverage WAS the measured bottleneck (central-Arlington POIs missing from destination search) — local bbox extract via `data/download_overture.sh`, queried by `OvertureMapDataSource` through duckdb (3,700+ places vs a handful from node-only Overpass); default `map_data_source` is now `hybrid` (OSM routing/geocoding + Overture places), and destination search merges Overture name matches with Nominatim addresses.** |
 | Contract tests | pytest, parametrized over implementations | One shared test suite every `MapDataSource` implementation must pass (`backend/tests/mapdata/test_contract.py`), so swapping/adding a provider can't silently break enrichment logic. |
 
 ### ML / AI
 | Component | Technology | Why |
 |---|---|---|
-| LLM | Claude API (claude-sonnet-4-6) | Best reasoning for preference extraction and conversation. Use Haiku for lower-latency in-session calls. |
+| LLM | **Built:** provider-agnostic `LLMClient` seam (`backend/ml/llm/base.py` + `factory.py`), first implementation is **Gemini** (`gemini-3.1-flash-lite`, via `ml/llm/gemini_client.py`) | Claude was the original plan, but only a Gemini API key was available when this was built. The seam mirrors `MapDataSource`'s design exactly: task logic (prompts, extraction schemas — `ml/llm/conversation.py`) is written against the interface only, so adding `claude_client.py` + a `settings.llm_provider="claude"` branch in `factory.py` is a same-day swap, not a rewrite. `gemini-2.5-flash-lite` 404s for keys created after its sunset — `3.1-flash-lite` is the working equivalent; re-verify against `ListModels` if this changes again. |
 | STT (voice input) | faster-whisper | Optimized Whisper — runs on-device or server, real-time transcription. |
 | TTS (voice output) | Coqui TTS (local) or ElevenLabs API | Coqui is free and runs locally. ElevenLabs sounds better but costs per character. Start with Coqui. |
 | GNN (map encoder) | PyTorch Geometric | Best library for graph neural networks. Encodes road network into vectors the RL model can consume. |
@@ -65,7 +65,7 @@
 |---|---|---|
 | Web app | React + TypeScript | Jonathan's domain. TypeScript catches bugs early in a complex app. |
 | Map rendering | MapLibre GL JS | Open-source Mapbox fork. Renders vector tiles in the browser with full styling control. |
-| Mobile app | React Native + MapLibre | Share business logic with web. Add later — focus web first. |
+| Mobile app | Capacitor (wraps the web build) | Supersedes the original React Native choice — the web UI already exists, so a WebView shell reuses every component + MapLibre GL JS as-is; only the GPS source goes native (background location). See Phase 4. React Native stays an option *only* if mobile later becomes the primary platform and native map perf justifies a UI rewrite. |
 | UI component library | shadcn/ui | Unstyled, accessible components — you own the styling, no fighting a design system. |
 | State management | Zustand | Lightweight and simple. Not overkill like Redux. |
 | Voice UI | Web Speech API + custom hook | Browser-native for web. Backed by faster-whisper on mobile. |
@@ -130,7 +130,7 @@ adaptive-map/
 │   │   │                     #   vocabulary enrichment code is allowed to speak
 │   │   ├── base.py           # MapDataSource ABC — the interface everything else is written against
 │   │   ├── osm_source.py     # OSMMapDataSource — v1 implementation, Overpass or self-hosted extract
-│   │   ├── overture_source.py  # OvertureMapDataSource — stub now, real once OSM places are a bottleneck
+│   │   ├── overture_source.py  # OvertureMapDataSource — duckdb over local Overture places parquet
 │   │   ├── hybrid_source.py    # Combines sources per-method (e.g. OSM routing + Overture places)
 │   │   └── factory.py        # get_map_data_source() — reads settings.map_data_source, returns impl
 │   ├── ml/                   # GNN, RL, preference embedding code
@@ -605,6 +605,7 @@ class PlaceCategory(str, Enum):
     FUEL = "fuel"
     PARKING = "parking"
     PARK = "park"
+    CAFE = "cafe"  # added in Week 11-12's stop-insertion conversation verb ("grab a coffee")
     RESTAURANT = "restaurant"
     GROCERY = "grocery"
     LODGING = "lodging"
@@ -1314,16 +1315,29 @@ async def get_route(request: RouteRequest, db=Depends(get_db)):
 
 #### Key additional endpoints Jonathan needs to build
 
+**Built (`backend/api/routes/`), reflects what's actually running — see the note below for what changed from the original list:**
+
 ```
-POST   /api/v1/users/register          — Create account + run onboarding
-POST   /api/v1/users/login             — JWT auth
-GET    /api/v1/users/{id}/profile      — Get full profile + preferences
-PATCH  /api/v1/users/{id}/preferences  — Update preferences
-POST   /api/v1/trips/{id}/gps-update   — Stream GPS position during trip
-POST   /api/v1/trips/{id}/complete     — Mark trip done, trigger signal processing
-POST   /api/v1/feedback/{trip_id}      — Submit post-trip text feedback
-GET    /api/v1/routing/search          — Geocoding (place name → lat/lon)
+POST   /api/v1/users/register           — Claim an email, get a user id back (idempotent)
+GET    /api/v1/users/{id}/profile       — Full profile: preferences + journey
+PATCH  /api/v1/users/{id}/preferences   — Update routing preferences (partial)
+PATCH  /api/v1/users/{id}/journey       — Update journey profile (home/work, convo style, ...)
+POST   /api/v1/trips/{id}/gps-update    — Batch-append GPS points during a drive (atomic)
+POST   /api/v1/trips/{id}/complete      — Mark trip done (idempotent)
+POST   /api/v1/feedback/{trip_id}       — Submit post-trip text feedback
+GET    /api/v1/routing/search           — Geocoding (place name → lat/lon)
+POST   /api/v1/routing/route            — Route calculation (see Week 3-4 client)
+POST   /api/v1/trips/{id}/conversation/open   — Week 11-12: pre-journey opener
+POST   /api/v1/trips/{id}/conversation/reply  — Week 11-12: reply -> intent/prefs/stops/etc.
+POST   /api/v1/trips/{id}/debrief/open        — Week 11-12 (moved up from 15-16): post-trip question
+POST   /api/v1/trips/{id}/debrief/reply       — writes trips.reward_value
 ```
+
+**What changed from the original plan, and why:**
+- **No `POST /users/login` / JWT.** Auth stayed deliberately minimal — registering *is* claiming an email; the client remembers the returned `user_id` in localStorage. Real auth is deferred until there's something worth protecting, not an oversight.
+- **`gps-update` takes a batch of points (`{"points": [...]}`), not one.** The first version did a single-point read-modify-write (load `actual_path_taken`, append in Python, overwrite) — two flushes in flight could each read the same array and the second would clobber the first's points. It's now an atomic SQL append (`actual_path_taken = coalesce(...) || cast(:pts as jsonb)`), which serializes concurrent flushes at the row lock instead of racing, and the client buffers a few seconds of fixes per request instead of one HTTP call per GPS fix.
+- **`PATCH /users/{id}/journey`** wasn't in the original list — it's the write side of the `user_journey_profiles` table from Week 9-10 (home/work locations, conversation style).
+- **The conversation/debrief endpoints** belong to Week 11-12 below, listed here because they live in the same `api/routes/` structure as everything else on this list.
 
 For geocoding (turning "Austin, TX" into coordinates), do **not** call Nominatim directly from this route handler. Use the `MapDataSource` interface built in [Map Data Abstraction Layer](#map-data-abstraction-layer) — `OSMMapDataSource.search_addresses()` already wraps Nominatim, and going through the interface here is what makes a later Overture/hybrid swap free.
 
@@ -1349,12 +1363,12 @@ There is no separate `backend/routing/geocoder.py` — geocoding is a `MapDataSo
 
 **Who:** Jonathan primarily, with you reviewing UX flow
 
-#### MapLibre GL setup
+**Built with different tooling than shown below — the shape held, the tools didn't:** Vite instead of Create React App (CRA is unmaintained; `npm create vite@latest -- --template react-ts`), plain `fetch` instead of axios (`frontend/src/lib/api.ts`, one typed function per endpoint, no client library needed), and a flatter component tree — `frontend/src/components/*.tsx` with no `Map/`/`Route/` subfolders (`MapView.tsx`, `PromptBar.tsx`, `TripPanel.tsx`, `PrefsPanel.tsx`, `Conversation.tsx`, `Debrief.tsx`). Route line rendering lives in `frontend/src/lib/routeLayers.ts`, not a `RouteLayer` component — MapLibre layers/sources don't need their own React component, just functions called from `MapView`'s effects. State is four Zustand stores (`useTripStore`, `useUserStore`, `useConvoStore`, `useDebriefStore`), not one. The self-hosted Martin tiles from Week 1-2 replace `tiles.openfreemap.org` in the actual map style (`frontend/src/lib/mapStyles.ts`).
 
 ```bash
 cd frontend
-npx create-react-app . --template typescript
-npm install maplibre-gl @maplibre/maplibre-react-components zustand axios
+npm create vite@latest . -- --template react-ts
+npm install maplibre-gl zustand
 npm install -D @types/maplibre-gl
 ```
 
@@ -1520,8 +1534,10 @@ CREATE TABLE trip_conversations (
 
 #### Claude API wrapper
 
+**Superseded — kept for reference on the prompt/output shape being followed, not the code to write.** `backend/ml/llm/claude_client.py` doesn't exist. What was actually built is `backend/ml/llm/`: `base.py` (the `LLMClient` ABC — one `complete(system, messages, max_tokens, json_mode)` method), `gemini_client.py` (the only implementation today), `factory.py` (`get_llm_client()`, reads `settings.llm_provider`), and `conversation.py` (the prompts + extraction logic below, rewritten against the seam instead of the `anthropic` SDK directly). The `SYSTEM_PROMPT_CONVERSATION` / `SYSTEM_PROMPT_EXTRACTOR` rules below (one question, under 30 words, structured JSON output) carried over essentially unchanged into `PRE_JOURNEY_SYSTEM` / `_REPLY_SYSTEM` in the real file — only the transport changed.
+
 ```python
-# backend/ml/llm/claude_client.py
+# SUPERSEDED — see note above. Not present in the codebase as ml/llm/claude_client.py.
 
 import anthropic
 from typing import AsyncGenerator
@@ -1631,9 +1647,21 @@ Extract driving preferences and compute reward delta from this conversation and 
 
 **Who:** You (logic), Jonathan (API endpoint + frontend integration)
 
-#### The conversation state machine
+**Built substantially beyond this section's scope — read this note before the code below, which is superseded.** The actual implementation differs from the plan in three ways, then goes further than Week 11-12 ever asked for:
+
+1. **Postgres, not Redis, holds conversation state.** There's no `ConversationEngine` class and no `redis.asyncio` — `trip_conversations` (the Week 9-10 table) *is* the state store. `backend/api/routes/conversation.py`'s `open_conversation`/`reply_conversation` load the latest row for a trip, append to its `messages` JSONB, and save — durable and queryable for free, at the cost of one extra round-trip Redis would have avoided. No `ConversationPhase` enum either; which phase a request is in is just which endpoint it calls (`conversation/open`, `conversation/reply`, `debrief/open`, `debrief/reply`).
+2. **The extraction schema grew well past "extract intent."** `interpret_reply()` (`backend/ml/llm/conversation.py`) pulls seven signals from one LLM call, not one: `intent` (hurry/explore), `preference_updates` (durable, confidence-gated — see `CONFIDENCE_FLOOR`), `switch_to_route` (an index into a `ROUTE OPTIONS` block the client sends with each reply, since re-routes create new trip rows and only the client knows what's currently drawn), `add_stop`/`remove_stops` (a category or named place resolved via the *same* `get_map_data_source()` from the Map Data Abstraction Layer — "grab a coffee on the way" becomes a real `Place` near the route's midpoint, in `_find_stop()`), `set_destination` (home/work, resolved client-side against the journey profile), and `travel_mode` (auto/bicycle/pedestrian, re-routes with different Valhalla `costing`). This means the pre-journey conversation can restructure the trip mid-conversation, not just tag it with a mood.
+3. **The post-trip debrief (originally Week 15-16) was built here too**, synchronously — `debrief/open` asks one question (`generate_debrief_question`), `debrief/reply` (`interpret_debrief`) extracts a `reward_delta` (-1..1) straight onto `trips.reward_value`, plus any durable preference updates. No Celery task; it happens inline in the request. See the Week 15-16 section below for what's still missing (GPS-based implicit reward, async processing).
+
+**Fixed (July 2026) — `trip_conversations.preference_updates_extracted` was overwritten, not appended.** Every reply reassigned the whole JSONB field, so only the *last* turn of a conversation survived. That silently destroyed the most valuable label the system produces: `switch_to_route` is a **pairwise preference** ("shown these options, chose #2"), which is far stronger training signal than a pointwise reward, and the Week 27-28 route scorer is exactly the consumer for it. It is now a list appended per turn, each entry carrying `phase`/`timestamp` plus the `route_options` that were on offer — without the options the chosen index is unresolvable later, since re-routes create new trip rows. JSONB stores arrays natively so no migration was needed; pre-existing rows are NULL and stay NULL. Regression test: `test_every_reply_appends_an_extraction`.
+
+**Also built, not in any version of this plan:** `frontend/src/lib/navigation.ts`'s `DriveController` streams a live position along the selected route to `gps-update` while "driving" (simulated in dev — no in-region test device — but the same batch-streaming pipeline a real `watchPosition` would use), which is the roadmap's undefined `ACTIVE_NAVIGATION` conversation phase made real. This is what actually produces the `actual_path_taken` trace the Week 15-16 adherence function needs — it didn't exist before this.
+
+**Superseded below — kept for the phase-machine shape the design followed, not code to write:**
 
 ```python
+# SUPERSEDED — no Redis/ConversationEngine in the codebase. See note above;
+# actual state machine is trip_conversations rows + which endpoint is called.
 # backend/ml/llm/conversation_engine.py
 
 from enum import Enum
@@ -1748,7 +1776,10 @@ class ConversationEngine:
 
 #### Frontend: conversation UI component
 
+**Superseded — actual components: `frontend/src/components/Conversation.tsx` (pre-journey) and `Debrief.tsx` (post-trip), backed by `stores/useConvoStore.ts` and `stores/useDebriefStore.ts` instead of local `useState`.** Notable differences from the sample below: state lives in Zustand so any component can read conversation status (not just the chat box itself), `Conversation` sends a `routeOptions` summary with every reply (the `switch_to_route` feature above needs it), and it renders *inside* `PromptBar`'s collapsed-trip state rather than as a separately-positioned floating box — the reserved slot `PromptBar` was designed around from Week 7-8. When the backend has no LLM configured (`503`), both components render nothing rather than an error — a silent, expected degraded mode, not a bug state.
+
 ```tsx
+// SUPERSEDED — see note above. Not present as Conversation/JourneyChat.tsx.
 // frontend/src/components/Conversation/JourneyChat.tsx
 
 import React, { useState } from 'react';
@@ -1820,6 +1851,8 @@ export const JourneyChat: React.FC<JourneyChatProps> = ({ tripId, onIntentConfir
 ### Week 13–14 — Voice Pipeline
 
 **Who:** You (faster-whisper + Coqui TTS server), Jonathan (frontend WebSocket)
+
+> **Status (July 2026):** partially superseded. Conversation/debrief voice shipped over plain HTTP instead of this section's design: browser Web Speech + a parallel MediaRecorder capture, with server-side STT via the existing Gemini seam (`POST /api/v1/speech/transcribe`, `backend/api/routes/speech.py`) when the browser engine returns nothing, and browser `SpeechSynthesis` for TTS — no faster-whisper, no Coqui, no new services. The **in-navigation real-time voice loop (the WebSocket endpoint below) remains not started** and is the open item if hands-free interaction during active driving becomes a priority.
 
 #### Voice backend service
 
@@ -2080,6 +2113,8 @@ The road network is a graph. Graph Neural Networks learn node and edge represent
 
 #### Graph construction from PostGIS
 
+> **Built (July 2026), with deviations from the sample below.** (1) `road_segments` had never been populated — a new ingestion pipeline (`backend/ml/gnn/ingest.py` + `backend/scripts/ingest_road_segments.py`, osmium CLI → GeoJSONSeq → junction-split rows) loads it from `data/osm/region.osm.pbf`; ways are split at coordinates shared between ways (5-decimal rounding, the same rounding graph_builder matches endpoints with) so segments run junction-to-junction — the sample assumed this but never specified it. Result for Central Arlington: 10,214 segments → 7,294 nodes / 18,821 directed edges, 99% in one connected component. (2) `build_road_graph_from_db` is async (`AsyncSession`) and reads endpoints via `ST_X/ST_Y(ST_StartPoint(...))` in SQL — asyncpg returns raw WKB, so the sample's `.x` attribute access doesn't work. (3) The sample's docstring promised junction-type/traffic-signal node features it never computed; the real contract is node 2-dim `[lon, lat]`, edge 11-dim, matching `RoadNetworkEncoder` defaults. (4) Deps: torch + torch-geometric moved to a lean optional `gnn` poetry group (`poetry install --with gnn`); unused torchvision dropped; the rest of the ml group stays for later weeks.
+
 ```python
 # backend/ml/gnn/graph_builder.py
 
@@ -2160,6 +2195,8 @@ def build_road_graph_from_db(db_session, bbox: tuple) -> Data:
 
 #### GNN model definition
 
+> **Built (July 2026), with three deviations from the sample below.** (1) Empty-graph guard: graph_builder returns valid empty graphs for out-of-data bboxes, and mean-pooling zero nodes is NaN — those encode to a zero vector instead. (2) Per-graph coordinate centering in `forward`: raw `[lon, lat]` node features (~-97/~32) are near-constant large values; subtracting the per-graph mean makes the encoding translation-invariant with no interface change. (3) Accepts both a bare `Data` and a `Batch` (batched RL training). Defaults are sourced from graph_builder's `NODE_FEATURE_DIM`/`EDGE_FEATURE_DIM` constants so the contract can't drift. Milestone verified: the real Arlington graph (7,294 nodes / 18,821 edges) encodes to a finite `(1, 128)` state vector; tests in `backend/tests/ml/test_model.py`.
+
 ```python
 # backend/ml/gnn/model.py
 
@@ -2230,6 +2267,8 @@ class RoadNetworkEncoder(nn.Module):
 **Who:** You
 
 Instead of a separate model per user (which doesn't scale), use a shared base model steered by a small per-user preference vector. This vector lives in Qdrant and is updated after every trip.
+
+> **Built (July 2026), neutral-init per spec (32-dim, zeros, cosine collection `user_preferences`), with three deviations.** (1) `PreferenceStore.__init__` accepts an injected `QdrantClient` (not just a `url`), so tests run fully in-memory via `QdrantClient(location=":memory:")` — no container, no skip. (2) Zero-vector guard: a zero-norm vector has undefined cosine distance, so untrained (all-zero) embeddings are never persisted; `get_or_create_embedding` returns neutral zeros in-memory and callers treat "no Qdrant point" as neutral. (3) Cosine collections unit-normalize on upsert, so `load_embedding` returns direction, not magnitude (documented; stash the norm in payload later if RL needs it). Also: `.search()` → `.query_points()` (qdrant-client 1.18 API); `qdrant-client` moved to a lean optional `rl` poetry group; `qdrant_url` added to config with the compose-hostname rewrite. Nothing consumes the embedding yet — Week 21-22 injects it. Files: `backend/ml/rl/preference_embedding.py`, tests in `backend/tests/ml/test_preference_embedding.py`.
 
 ```python
 # backend/ml/rl/preference_embedding.py
@@ -2309,6 +2348,10 @@ class PreferenceStore:
 ### Week 21–22 — RL Training Pipeline
 
 **Who:** You
+
+> **Built (July 2026) as the synthetic scaffold this section actually specifies, with deliberate corrections — the samples below are not runnable as written, and empirically not learnable as designed.** Key deviations in `backend/ml/rl/environment.py` + `train.py`: (1) the sample's observation (`[whole-graph GNN emb | user emb | progress]`) contains no position/destination signal — the built env keeps the 168-dim layout but fills the 8 context dims with normalized current/destination coords, delta, and distance; (2) **compass-sector actions with snapping**: the sample's "action i = i-th neighbor by id" points a different direction at every junction (unlearnable without memorizing the map); the built env assigns neighbors to 45°-bearing slots and snaps empty-sector actions to the nearest road, so every action means "head roughly that way" and no invalid-action penalty exists to drown the navigation gradient (each of these fixes was validated empirically — with id-order actions or invalid-action penalties the policy stayed near-uniform for 80k steps and reached 0 destinations; with the final design it demonstrably navigates); (3) **curriculum episode sampling**: random origins avoid sink nodes (one-way endings) and random destinations are BFS-capped at `episode_hop_limit` hops (uniform pairs average ~19 hops and even a greedy-compass oracle solves only ~half — no bootstrap signal); (4) dropped the env ctor's unused `preference_store`/`db` args (fixes the training script's 2-vs-4-arg call); shared frozen GNN encoder across vec envs, graph embedding cached once, adjacency precomputed; (5) potential-based distance shaping (optimal-policy-preserving, scale 2.0 so progress outweighs step cost); (6) `inject_trip_reward` raises `NotImplementedError` pointing at Week 23-24 — real trip-reward replay is deferred (no trip data yet; the sample's version silently discarded rewards); `fine_tune_for_user` conditions on the user embedding only and says so; (7) gymnasium/stable-baselines3/mlflow promoted to the lean `rl` poetry group (ray unused — SB3, not rllib); `mlflow_url` in config, local default sqlite store (mlflow 3.x deprecated the file store); artifacts in gitignored `backend/models/`. CLI: `backend/scripts/train_rl.py`. Learnability verified on a 787-node downtown subgraph: 80k PPO steps → reward −1.9→−0.95, greedy eval reaches destinations with 38% mean progress-to-goal (scales with more timesteps; roadmap default is 1M). **Open seam for Week 27-28 — RESOLVED (July 2026), by *not* reconciling the layouts.** The two state vectors describe different problems (sequential navigation vs one-shot ranking) and are deliberately kept separate: `ml/rl/state.py` builds ranking features, this env builds nav observations, and the module docstrings say they must never be fed to each other's model. See the Week 27-28 note.
+
+**Dead-dimension fix (July 2026).** Base training left 160 of the 168 observation dims constant. (1) `train_base_model` never passed a `user_embedding`, so it defaulted to `np.zeros(32)`; those weights got exactly zero gradient (`dL/dW[:,i] ∝ x_i = 0`) and never left random init — the policy was provably invariant to the user embedding, and `fine_tune_for_user` then fed a nonzero vector into those untrained weights, injecting noise instead of personalizing. Fixed: `RouteEnvironment` takes an optional `user_embedding_fn` resampled every `reset()`, and `train_base_model(randomize_users=True)` (the default) draws a fresh user per episode from `[-1, 1]^32`, matching `PreferenceEmbedding`'s tanh-bounded range. Measured before/after over 4096 steps: user-dim weight movement `0.00000000` → `0.0204` (context dims move `~0.04-0.05` in both). `randomize_users` is logged to MLflow because runs across the fix are not comparable. (2) The other 128 dims are still constant — `RoadNetworkEncoder` is randomly initialized, never trained, and encodes one fixed graph, so the block acts as a bias term. Fixing that needs a *trained* encoder (self-supervised objective, or RL gradients flowing through it across multi-graph episodes) and is deferred, documented in the env docstring. Neither issue affects production routing, which is served by the supervised scorer.
 
 ```python
 # backend/ml/rl/environment.py
@@ -2509,6 +2552,8 @@ def fine_tune_for_user(
 
 This is the component that ties together all the signals you've been collecting and produces a single reward value that the RL model can learn from.
 
+> **Built (July 2026). Half of this section already existed** — the debrief path (`interpret_debrief`) turns explicit feedback into a `reward_delta`. So the work here was the *implicit* half + fusion. Deviations: (1) **numeric confidence-weighted fusion** in `backend/ml/rl/reward_engine.py` `compute_final_reward(implicit, explicit)`, NOT the sample's second LLM call — the debrief already interpreted the user's words, so re-calling would duplicate it (sources: `fused`/`implicit_only`/`explicit_only`/`neutral`; implicit fixed confidence 0.6, explicit weighted by its own). (2) The roadmap's hardcoded `claude-sonnet-4-6` client doesn't exist here — an optional LLM-fusion path would go through the Gemini `LLMClient` seam, but isn't wired. (3) **This also delivers the never-built Week 15-16 `signal_processor`**: `backend/services/signal_processor.py` computes real adherence from `actual_path_taken` vs the decoded `suggested_route` polyline (hand-rolled precision-6 decoder, no new dep), with a **corrected local-meters projection** instead of the sample's flat `degrees*111_000` (wrong for longitude). `app_switch_count` is stubbed 0 (no data source). (4) **Wired live with graceful degradation**: `complete_trip` computes the implicit reward from the trace (replacing the old fake neutral 0.0); `reply_debrief` fuses implicit+explicit. No GPS trace → degrades to explicit-only or neutral. Synchronous, no Celery. (5) The RL side (`inject_trip_reward`) now has real rewards to consume but the offline replay-buffer→PPO path stays an unbuilt seam. Verified end-to-end: on-route trace → `implicit_only` reward, arriving early bumps it via the time bonus, then a positive debrief → `fused` reward pulled toward the sentiment. Files: `signal_processor.py`, `reward_engine.py`, tests `test_signal_processor.py`/`test_reward_engine.py` + `test_api_trips.py`.
+
 ```python
 # backend/ml/rl/reward_engine.py
 
@@ -2587,6 +2632,15 @@ Compute the final reward signal and extract preference updates."""
 **Who:** You (Flower server), Jonathan (client API endpoint on mobile)
 
 Federated learning lets user preferences improve the global model without any raw personal data ever leaving the user's device.
+
+**Decision (July 2026) — hold Flower/Ray; the client-server design below is deferred, and its privacy premise doesn't hold yet. Read before the code.** Two things make it premature:
+
+1. **There's no privacy boundary to protect.** FL exists so raw data never leaves the device — but every trip, `reward_value`, and conversation already lives in Postgres server-side. A "federated" server that reads each user's trips from *its own database* is centralized training with a gRPC layer cosplaying as a network boundary. FL earns its keep only once a client (the Phase 4 mobile app) holds data the server doesn't.
+2. **Flower's simulation engine needs Ray, which this stack avoids (py3.13/arm64).** Ray is required only by Flower's Virtual Client Engine (`start_simulation`) — the *testing* convenience that fakes N clients in one process. The deployment runtime (`start_client`/`start_server`) doesn't need Ray, but there are no clients to deploy to yet.
+
+**Build instead:** FedAvg as an in-process, weighted-average loop over users read from Postgres — the same math as `AdaptiveMapFedStrategy.aggregate_fit` below (clone the global model per user, fine-tune on their trips, average the deltas weighted by trip count), minus the transport and the (nonexistent) privacy boundary. Keep it behind a `fit()`/`aggregate()` seam matching Flower's `NumPyClient`/`Strategy` so adopting Flower later is a transport swap, not a rewrite. The sample `fit()` loss further down (`-reward.mean() * embedding.norm()`) is a placeholder — use the real reward-conditioned fine-tune from Week 23-24.
+
+**Topology when mobile ships (see Phase 4 — Mobile App):** default to **cross-silo / per-user backend clients** — Flower's deployment runtime with each client a server-side process scoped to one user's data (no Ray). Do *not* assume true on-device training: a Capacitor WebView is a poor host for on-device PyTorch/TFLite, and the preference model is a tiny embedding, so the privacy-vs-toolchain-cost tradeoff favors backend clients unless on-device privacy becomes a hard product requirement.
 
 ```python
 # backend/ml/federated/flower_server.py
@@ -2687,7 +2741,26 @@ class UserPreferenceClient(fl.client.NumPyClient):
 
 **Who:** You. Final integration of all ML components into the routing API.
 
+> **Built (July 2026) — as a *supervised* ranker, not an RL one. The sample below is superseded and is not runnable as written.** Three things were wrong with it, found by reading the trained artifact rather than the plan:
+>
+> 1. **It crashes.** It builds a 52-dim `[route features | user | intent]` vector and calls `predict_values()` on a policy whose observation space is `Box(168,)` — a shape error at the first `Linear`. Padding the dims to match would only convert a loud crash into a *silent garbage score*, since route-summary features are nothing like the distribution that layer was fit on.
+> 2. **The PPO value head answers the wrong question.** It estimates discounted reward-to-go for a step-level navigation MDP — effectively negative distance-to-goal. It has no notion of "which of these three complete routes suits this user". Ranking 3 candidates is a *one-shot* choice with no trajectory and no credit assignment, so there is nothing for RL to contribute.
+> 3. **The user embedding was dead weight anyway.** During base training `train_base_model` never passed a `user_embedding`, so it defaulted to `np.zeros(32)`; those weights received exactly zero gradient (measured: `0.00000000` movement over 4096 steps, versus `0.049` for the context dims) and stayed at random init. The policy was provably invariant to the user embedding — and `fine_tune_for_user` then fed a *nonzero* vector into those untrained weights, injecting noise rather than personalizing. Fixed separately, see the Week 21-22 note.
+>
+> **What was built instead:** `backend/routing/route_ranker.py` (`RouteRanker`) + `backend/ml/rl/route_scorer.py` (`RouteScorer`) + `backend/ml/rl/state.py` (`build_scoring_features`, 20 dims, every one populated). Valhalla still generates candidates; a supervised model trained on logged `trips.reward_value` — the label Week 23-24's fusion already produces — predicts each candidate's reward, and the best index is recommended.
+>
+> - **Ridge regression, not a neural net.** The realistic dataset is tens-to-low-hundreds of trips against 20 features; an MLP there memorizes while reporting a low training loss. Ridge is closed-form (no training loop, no seed, no silent non-convergence), L2-regularized, interpretable via `explain()`, and **pure numpy — so serving never needs torch**, which matters because torch lives in optional poetry groups (`gnn`/`rl`) that a production install may not have. `train_route_scorer` refuses to fit below `MIN_TRAINING_SAMPLES` (30) rather than ship a model that ranks arbitrarily.
+> - **Interaction features carry it.** `conflict_highway = has_highway * avoid_highways` (and toll/turn equivalents) encode the rule that actually matters, so linear capacity suffices — that is what makes learning from a few dozen trips feasible.
+> - **The candidate list is never reordered, only *selected* from.** `trips.suggested_route` stores the engine response verbatim and `services/signal_processor.py` resolves geometry positionally from it, so shuffling the array would silently misalign stored trips from the routes they describe. The frontend already honours `recommended_index` (`selectedIndex` in `useTripStore`), so selecting is enough to change what the user sees.
+> - **Cold start is the default path.** No model file, an unreadable one, a stale feature layout, one candidate, or any scoring exception → Valhalla's own primary, `personalization_active: false`. Wiring it into `POST /route` is therefore behaviour-preserving until someone runs `backend/scripts/train_route_scorer.py`, and no route request can fail because of the ML layer.
+> - The per-user *latent* embedding from `preference_embedding.py` is deliberately **not** an input yet: nothing writes it during a trip, so it would be a constant-zero block — the same dead-dimension bug. It concatenates in through the same seam once the RL loop populates it.
+> - Naming: not `rl_router.RLEnhancedRouter`. It is supervised regression, and calling it RL would misrepresent what runs in production.
+>
+> Tests: `backend/tests/ml/test_route_scorer.py` (features, training floor, save/load, stale-layout rejection, fallbacks) and two endpoint tests in `backend/tests/test_api_routing.py` — one asserting the ranking decision is persisted to `trips.context`, one proving a scorer that prefers slow routes actually moves `recommended_index` off Valhalla's primary against a live instance.
+
 ```python
+# SUPERSEDED — see the note above. Not present as backend/routing/rl_router.py;
+# the built equivalent is routing/route_ranker.py + ml/rl/route_scorer.py.
 # backend/routing/rl_router.py
 
 import torch
@@ -2805,6 +2878,60 @@ class RLEnhancedRouter:
         encoded = [1.0 if i == (intent or "none") else 0.0 for i in intents]
         return np.array(encoded + [0, 0, 0, 0], dtype=np.float32)  # Pad to 8
 ```
+
+---
+
+## Phase 4 — Mobile App (Capacitor)
+
+**Who:** Jonathan (Capacitor shell, native plugins), You (background-GPS pipeline, on-device-vs-backend FL call).
+
+**Status:** Not started — planned for after the web app is feature-complete and responsive. This supersedes the Tech Stack table's original React Native choice; the reasoning is below.
+
+### Why Capacitor, not React Native
+
+React Native + MapLibre Native was chosen *before* the web UI existed, when "share business logic with web" was cheap. It isn't anymore — `frontend/src/` is a working React + Vite + MapLibre GL JS app (`MapView`, `PromptBar`, `TripPanel`, `PrefsPanel`, `Conversation`, `Debrief`, four Zustand stores, `lib/navigation.ts`'s `DriveController`). React Native would mean **rewriting every view** and swapping MapLibre GL JS for a different native SDK. Capacitor wraps the existing Vite build as-is in a native shell — the WebView runs the current app unchanged (MapLibre GL JS is WebGL, GPU-accelerated, fine in a WebView) — and adds native plugins only where the browser can't reach.
+
+The deciding constraint is **background geolocation**. The whole Phase 2/3 loop depends on streaming GPS during a drive (`DriveController` → `gps-update` → `actual_path_taken` → the Week 15-16 adherence reward → Phase 3 RL). An app that stops tracking when the screen turns off is broken for its core purpose — which rules out a plain PWA (no reliable background GPS, especially iOS) and is exactly what a Capacitor native plugin provides.
+
+### What you reuse vs. rewrite
+
+| Layer | Web (today) | Capacitor | Effort |
+|---|---|---|---|
+| Views / components | `frontend/src/components/*.tsx` | **Reused unchanged** in the WebView | none |
+| Map rendering | MapLibre GL JS | **Reused** (runs in WebView) | none |
+| State, API client, types | 4 Zustand stores, `lib/api.ts`, `types/` | **Reused unchanged** | none |
+| GPS source | `DriveController` (simulated / browser `watchPosition`) | **Swap to native geolocation** — the one real change | small |
+| Voice | Web Speech API | Reused in WebView, with a caveat (below) | none–small |
+| Shell / build | Vite `dist/` | Wrapped by Capacitor; adds iOS/Android projects | setup |
+
+### The one real code change: `DriveController`'s GPS source
+
+`lib/navigation.ts`'s `DriveController` already streams batched positions to `gps-update` using "the same batch-streaming pipeline a real `watchPosition` would use" (per the Week 11-12 note). So the mobile work is a **source swap, not a rewrite**: replace the simulated position feed with
+
+- **`@capacitor/geolocation` `watchPosition`** for the foreground drive, and
+- a **background-geolocation plugin** (e.g. `@capacitor-community/background-geolocation`) so fixes keep flowing to `gps-update` when the screen is off,
+
+feeding the *same* batch buffer → `gps-update` pipeline. Nothing downstream (`actual_path_taken`, the reward function, the RL trace) changes. This is the highest-value part of the port and the reason to leave the browser at all.
+
+### Integration steps (low-regret order)
+
+1. **Ship the responsive-web milestone first** (already an Integration acceptance criterion) — it's the shared foundation, no Capacitor required.
+2. **Add Capacitor to the existing Vite project** — `npm i @capacitor/core @capacitor/cli`, `npx cap init`, point `webDir` at the Vite `dist/`, `npx cap add ios android`. No app-code changes.
+3. **Fix the tile + API base URLs for the WebView origin** (see gotcha below) — mandatory, not optional.
+4. **Swap the `DriveController` GPS source** to the native plugins above; request "always" location permission and declare the iOS background-location entitlement.
+5. **Test the drive loop on a real in-region device** — the one thing dev simulation can't cover.
+6. **Leave voice on Web Speech initially**; fall back to the server-side STT path if the WebView's speech support is unreliable (it often is).
+
+### Gotchas specific to the WebView
+
+- **Tile and API URLs can't use `window.location.origin`.** On web, Martin tile URLs and the API base are resolved against `window.location.origin` (see the Week 1-2 tile-worker note). In a Capacitor WebView the origin is a **local scheme** (`capacitor://localhost` on iOS, `http://localhost` on Android), not your backend host — so that resolution points tiles and API calls at the device and everything silently fails to load. Make the backend host an explicit, env-injected config value for the mobile build; do not derive it from the WebView origin.
+- **iOS background location needs entitlements + a clear usage string**, and Apple review scrutinizes "always" location — justify it with the navigation use case in the review notes.
+- **MapLibre GL JS runs, but at WebView performance.** Fine for this app's layer count; if the map ever feels heavy on low-end Android, *that's* the signal to reconsider MapLibre Native — not before.
+- **Web Speech in a WebView is inconsistent** (and is already unreliable in Chrome on at least one dev machine). Keep the server-side STT fallback as the primary voice path on mobile rather than assuming browser speech works.
+
+### Federated learning on mobile (ties to Week 25-26)
+
+When this app ships, it becomes the "client" the FL design assumed — but **default to cross-silo / per-user backend clients, not on-device training**. A Capacitor WebView is a poor host for on-device PyTorch/TFLite; the preference model is a tiny embedding; and the privacy-vs-toolchain-cost tradeoff favors backend clients unless on-device privacy becomes a hard product requirement. See the Week 25-26 Decision note.
 
 ---
 
@@ -2967,47 +3094,59 @@ jobs:
 Use this as your weekly check-in. Do not move to the next phase until the current one is fully checked off.
 
 ### Phase 1 — Base Route Planner
-- [ ] Docker Compose starts all services without errors
-- [ ] OSM data downloaded and Valhalla tiles built for your target region
-- [ ] PostGIS schema migrated with all tables created
-- [ ] `MapDataSource` interface (`backend/mapdata/base.py`) and `Place`/`Address`/`BBox`/`RoutingGraphRef` models exist
-- [ ] `OSMMapDataSource` implements the interface and passes `backend/tests/mapdata/test_contract.py`
-- [ ] `get_map_data_source()` factory reads `settings.map_data_source` and is the only construction point used by API code
-- [ ] No `httpx`/`requests` calls to Overpass/Nominatim exist outside `backend/mapdata/`
-- [ ] GET `/api/v1/routing/route` returns a valid Valhalla route
-- [ ] Route alternatives (3 options) return correctly
-- [ ] Trips are saved to the database on every route request
-- [ ] MapLibre GL renders a route on the map in the browser
-- [ ] User can type a place name and get coordinates via `get_map_data_source().search_addresses()` (geocoding works)
-- [ ] User preferences (avoid highways, avoid tolls) change the returned route
-- [ ] Basic turn-by-turn instruction list displays in sidebar
+- [x] Docker Compose starts the services actually in use (`postgres`, `valhalla`, `martin`) without errors — the full compose file (`redis`, `qdrant`, `mlflow`, `backend`/`celery_worker`/`frontend` Docker builds) is unverified; backend and frontend run directly via `poetry`/`npm` in dev, not through their Dockerfiles
+- [x] OSM data downloaded and Valhalla tiles built for the target region (Central Arlington, TX extract)
+- [x] PostGIS schema migrated with all tables created — `users`, `user_preferences`, `trips`, `road_segments`, plus Week 9-10's `user_journey_profiles`/`trip_conversations` (see `backend/db/migrations/versions/`)
+- [x] `MapDataSource` interface (`backend/mapdata/base.py`) and `Place`/`Address`/`BBox`/`RoutingGraphRef` models exist
+- [x] `OSMMapDataSource` implements the interface and passes `backend/tests/mapdata/test_contract.py` (network-dependent Overpass tests self-skip on 5xx/timeout rather than failing the suite)
+- [x] `get_map_data_source()` factory reads `settings.map_data_source` and is the only construction point used by API code
+- [x] No `httpx`/`requests` calls to Overpass/Nominatim exist outside `backend/mapdata/`
+- [x] POST `/api/v1/routing/route` returns a valid Valhalla route (the checklist originally said GET — the built endpoint is POST, since it also creates a `trips` row as a side effect)
+- [x] Route alternatives (3 options) return correctly
+- [x] Trips are saved to the database on every route request
+- [x] MapLibre GL renders a route on the map in the browser
+- [x] User can type a place name and get coordinates via `get_map_data_source().search_addresses()` (geocoding works)
+- [x] User preferences (avoid highways, avoid tolls) change the returned route
+- [x] Basic turn-by-turn instruction list displays in sidebar
 
 ### Phase 2 — LLM Conversation Layer
-- [ ] User profile table populated on registration
-- [ ] Claude API returns a contextual pre-journey message based on user profile
-- [ ] Message is under 30 words and asks at most one question
-- [ ] User reply is stored in `trip_conversations` table
-- [ ] Intent (hurry / explore) extracted from user reply updates route weights
-- [ ] Voice input (faster-whisper) transcribes speech correctly
-- [ ] Coqui TTS synthesizes response audio and plays in browser
-- [ ] Post-trip debrief message is sent after trip completion
-- [ ] Claude extracts structured preference signals from post-trip conversation
-- [ ] Celery task processes trip completion and updates `trips.implicit_signals`
-- [ ] `trips.reward_value` is set for every completed trip
+- [x] User profile table populated on registration (`user_preferences` + `user_journey_profiles`, both created in the same transaction as the `users` row)
+- [x] A contextual pre-journey message is returned based on user profile — via **Gemini**, not Claude (see the Tech Stack table and Week 9-10 note); the `LLMClient` seam makes the provider a config value, not a rewrite
+- [x] Message is under 30 words and asks at most one question — enforced by prompt instruction (`PRE_JOURNEY_SYSTEM`), not validated in code
+- [x] User reply is stored in `trip_conversations` table
+- [x] Intent (hurry / explore) extracted from user reply updates route weights (`declared_intent` → `UserRoutingPrefs.urgency`)
+- [ ] Voice input (faster-whisper) transcribes speech correctly — not started (Week 13-14)
+- [ ] Coqui TTS synthesizes response audio and plays in browser — not started (Week 13-14)
+- [x] Post-trip debrief message is sent after trip completion — built here, ahead of its original Week 15-16 slot (`debrief/open` + `debrief/reply`)
+- [x] Gemini extracts structured preference signals from post-trip conversation (`interpret_debrief`, confidence-gated the same way as the pre-journey extractor)
+- [ ] Celery task processes trip completion and updates `trips.implicit_signals` — done **synchronously** instead: `debrief/reply` writes `implicit_signals.debrief` and `reward_value` inline, in the same request. No Celery/Redis async processing exists yet; revisit only if profiling shows the extraction call needs to leave the request path
+- [ ] `trips.reward_value` is set for every completed trip — only true for trips that complete *through the debrief flow*; a trip wrapped up via the plain-note fallback (LLM unconfigured) or abandoned without opening the debrief leaves `reward_value` null
+
+**Beyond this checklist — built in the same pass, not in the original Phase 2 plan:**
+- [x] Reply can switch the displayed route to a different alternate (`switch_to_route`, validated against a client-sent `route_options` list — re-routes create new trip rows, so the client is the only party that knows what's currently drawn)
+- [x] Reply can insert a waypoint stop by category or name ("grab a coffee on the way" → resolved via `get_map_data_source()` to a real nearby place, re-routes through it) and remove it ("skip the coffee")
+- [x] Reply can redirect to the user's saved Home/Work location (`set_destination`), also exposed as one-tap chips in the empty prompt bar
+- [x] Reply can switch travel mode — auto/bicycle/pedestrian — which changes Valhalla `costing` and skips the auto-only preference-cost translation for bike/walk
+- [x] Live navigation: GPS position streams to `gps-update` while a trip is "driven" (`DriveController`, see the Week 11-12 note above) — the roadmap's undefined `ACTIVE_NAVIGATION` phase, now real, and the source of the `actual_path_taken` trace Week 15-16 needs
+- [x] The `gps-update` endpoint was rewritten from single-point read-modify-write (which lost points under concurrent flushes) to an atomic batched SQL append — see the Week 5-6 endpoint note above
 
 ### Phase 3 — RL Personalization
-- [ ] GNN encodes a road graph subgraph into a 128-dim vector without errors
-- [ ] User preference embedding is initialized (zeros) for new users
-- [ ] Preference embedding is stored and retrieved from Qdrant
-- [ ] Base RL model trains for 100k steps on synthetic routing tasks without crashing
-- [ ] Reward function combines implicit + explicit signals into a single float
-- [ ] LLM-extracted preference signals update the `user_preferences` table
-- [ ] RL router scores multiple route candidates and returns ranked list
-- [ ] Personalized route is measurably different from default route for a user with strong preferences
-- [ ] Federated learning server starts and accepts at least 3 clients
-- [ ] User preference embedding updates after each trip (verify via Qdrant query)
-- [ ] MLflow experiment dashboard shows training runs with logged metrics
-- [ ] Cold start (new user) gets sensible routes via similar-user bootstrapping
+- [x] GNN encodes a road graph subgraph into a 128-dim vector without errors — verified on the real Arlington graph (7,294 nodes / 18,821 edges → finite `(1, 128)`); `backend/tests/ml/test_model.py`. Note the encoder is **randomly initialized and never trained** — see the open issue below
+- [x] User preference embedding is initialized (zeros) for new users — `get_or_create_embedding` returns neutral zeros in-memory; zero vectors are deliberately never persisted (undefined cosine distance)
+- [x] Preference embedding is stored and retrieved from Qdrant — `save_embedding`/`load_embedding` work and are covered by in-memory Qdrant tests, but **have no production call site**: nothing outside `backend/tests/` constructs a `PreferenceStore` yet
+- [x] Base RL model trains for 100k steps on synthetic routing tasks without crashing — trains and demonstrably navigates, verified at 80k steps on a 787-node downtown subgraph (reward −1.9→−0.95, greedy eval reaches destinations at 38% mean progress-to-goal). A full 100k/1M run on the whole graph hasn't been done. **Any policy trained before the July 2026 `randomize_users` fix should be retrained** — it ignores the user embedding entirely (see the Week 21-22 note)
+- [x] Reward function combines implicit + explicit signals into a single float — `ml/rl/reward_engine.py::compute_final_reward`, wired live into `complete_trip` (implicit) and `reply_debrief` (fusion), degrading to explicit-only/neutral when there's no GPS trace
+- [x] LLM-extracted preference signals update the `user_preferences` table — confidence-gated (`CONFIDENCE_FLOOR`) in both `interpret_reply` and `interpret_debrief`
+- [x] RL router scores multiple route candidates and returns ranked list — built as a **supervised** ranker (`routing/route_ranker.py` + `ml/rl/route_scorer.py`), not the roadmap's PPO-value-head sample, which crashes on a shape mismatch and answers the wrong question; see the Week 27-28 note. Wired into `POST /route` with a deterministic fallback, so it is behaviour-preserving until a model is trained
+- [x] Personalized route is measurably different from default route for a user with strong preferences — *mechanism* proven end-to-end against live Valhalla (`test_trained_ranker_changes_the_recommendation`: a scorer preferring slow routes moves `recommended_index` off Valhalla's primary). **Not yet demonstrated from real learned preferences** — that needs ≥30 completed trips with `reward_value` before `scripts/train_route_scorer.py` will emit a model at all
+- [ ] Federated aggregation runs — in-process weighted FedAvg over per-user models read from Postgres (no Flower/Ray yet; see the Week 25-26 Decision note). A real Flower client-server topology is deferred to the mobile app (Phase 4), defaulting to cross-silo / per-user backend clients. **Deliberately deferred, not behind schedule** — there is no privacy boundary to protect until mobile ships
+- [ ] User preference embedding updates after each trip (verify via Qdrant query) — no trip → embedding write path exists; `trips.reward_value` is computed and stored but never consumed by anything
+- [x] MLflow experiment dashboard shows training runs with logged metrics — `train.py` logs params, `final_ep_rew_mean`, and the model artifact. Defaults to a local sqlite store (`mlruns.db`); the compose `mlflow` service is still unverified, same as the other unused compose services in Phase 1
+- [ ] Cold start (new user) gets sensible routes via similar-user bootstrapping — `find_similar_users` exists and is tested, but has no caller; bootstrapping is part of the unbuilt router
+
+**Resolved (July 2026) — the state-layout issue that blocked Week 27-28.** The env's 168-dim observation is `[graph_emb (128) | user_emb (32) | context (8)]`, and base training left 160 of those dims constant: the GNN encoder is never trained (one fixed random vector), and the user embedding defaulted to zeros (zero gradient, weights frozen at init). So the base policy was effectively an 8-input navigation controller whose value head estimates negative distance-to-goal — it knew nothing about route quality for a user, and the Week 27-28 sample's `predict_values()` call would have crashed on the shape mismatch anyway.
+
+Two separate fixes, both landed: the user-embedding dims are now resampled per episode during base training (measured `0.00000000` → `0.0204` weight movement — see the Week 21-22 note), and route ranking is served by a **supervised scorer** rather than by reshaping the router's state to match the policy's. The 128 graph-embedding dims remain constant and are documented-as-deferred; they need a trained encoder, which nothing currently depends on. See the Week 27-28 note for the built design.
 
 ### Integration
 - [ ] Full end-to-end test passes: signup → route → drive → feedback → preference update
@@ -3016,6 +3155,14 @@ Use this as your weekly check-in. Do not move to the next phase until the curren
 - [ ] App works on mobile browser (responsive design)
 - [ ] All API endpoints have basic error handling and return meaningful errors
 - [ ] Staging environment deployed and accessible via public URL
+
+### Phase 4 — Mobile App (Capacitor)
+- [ ] Responsive web app verified on real mobile browsers (the Integration item above) — the Capacitor foundation
+- [ ] Capacitor wraps the Vite build; iOS + Android projects build and launch the existing web app in a WebView
+- [ ] Tile and API base URLs point at the deployed backend host explicitly (not `window.location.origin`) in the mobile build
+- [ ] `DriveController` streams GPS from native geolocation (foreground) + background-geolocation plugin (screen off) to `gps-update`
+- [ ] Full drive loop verified on a real in-region device — route → background GPS → `actual_path_taken` → debrief
+- [ ] Voice falls back to server-side STT when WebView Web Speech is unavailable
 
 ---
 

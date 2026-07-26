@@ -11,6 +11,7 @@ see the Map Data Abstraction Layer section of the roadmap for the rule.
 from __future__ import annotations
 
 import uuid
+from typing import Literal
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -21,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import Trip, UserPreference
 from db.session import get_db
+from routing.route_ranker import RouteRanker
 from routing.valhalla_client import UserRoutingPrefs, ValhallaRouter
 
 router = APIRouter()
@@ -34,6 +36,11 @@ class RouteRequest(BaseModel):
     user_id: str | None = None
     declared_intent: str | None = None   # "hurry", "explore", "commute"
     waypoints: list[dict] = Field(default_factory=list)
+    mode: Literal["auto", "bicycle", "pedestrian"] = "auto"
+    # Human labels for the endpoints — stored in trips.context so the
+    # conversation layer can say "to Globe Life Field" instead of coordinates.
+    origin_label: str | None = None
+    dest_label: str | None = None
 
 
 class RouteResponse(BaseModel):
@@ -47,6 +54,12 @@ class RouteResponse(BaseModel):
 def _get_router(request: Request) -> ValhallaRouter:
     # Created once in the app lifespan (api/main.py) so connections pool.
     return request.app.state.valhalla_router
+
+
+def _get_ranker(request: Request) -> RouteRanker:
+    # Also built once in the lifespan (loads the scorer from disk at most once).
+    # Tests that construct routes without the lifespan get a fallback ranker.
+    return getattr(request.app.state, "route_ranker", None) or RouteRanker(None)
 
 
 async def _load_prefs(
@@ -78,6 +91,7 @@ async def get_route(
     request: RouteRequest,
     db: AsyncSession = Depends(get_db),
     router_client: ValhallaRouter = Depends(_get_router),
+    ranker: RouteRanker = Depends(_get_ranker),
 ):
     prefs = await _load_prefs(db, request.user_id, request.declared_intent)
 
@@ -87,6 +101,7 @@ async def get_route(
             destination=(request.dest_lat, request.dest_lon),
             waypoints=[(wp["lat"], wp["lon"]) for wp in request.waypoints] or None,
             prefs=prefs,
+            costing=request.mode,
         )
     except httpx.HTTPStatusError as exc:
         # Valhalla returns 400 with a JSON error for unroutable points (e.g.
@@ -98,21 +113,41 @@ async def get_route(
 
     routes = [data["trip"]] + [alt["trip"] for alt in data.get("alternates", [])]
 
+    # Which candidate to recommend. With no trained scorer this returns 0
+    # (Valhalla's own primary), so the endpoint behaves exactly as before until
+    # scripts/train_route_scorer.py has enough labelled trips. The candidate
+    # list is never reordered — see RankedRoutes' docstring.
+    route_context = {"declared_intent": request.declared_intent, "mode": request.mode}
+    ranked = ranker.rank(routes, prefs, route_context)
+
     trip = Trip(
         user_id=uuid.UUID(request.user_id) if request.user_id else None,
         origin=WKTElement(f"POINT({request.origin_lon} {request.origin_lat})", srid=4326),
         destination=WKTElement(f"POINT({request.dest_lon} {request.dest_lat})", srid=4326),
         suggested_route=data,
-        context={"declared_intent": request.declared_intent},
+        context={
+            "declared_intent": request.declared_intent,
+            "origin_label": request.origin_label,
+            "dest_label": request.dest_label,
+            "waypoints": request.waypoints,
+            "mode": request.mode,
+            # Recorded so training can reconstruct which route we actually put
+            # in front of the user — `suggested_route` keeps every candidate,
+            # and this says which one was recommended out of them.
+            "recommended_index": ranked.recommended_index,
+            "route_scores": ranked.scores,
+            "personalization_active": ranked.personalization_active,
+        },
     )
     db.add(trip)
     await db.commit()
 
+    recommended = routes[ranked.recommended_index]
     return RouteResponse(
         trip_id=str(trip.id),
         routes=routes,
-        recommended_index=0,
-        estimated_minutes=data["trip"]["summary"]["time"] / 60,
+        recommended_index=ranked.recommended_index,
+        estimated_minutes=recommended["summary"]["time"] / 60,
         context_summary="Route calculated based on your preferences.",
     )
 

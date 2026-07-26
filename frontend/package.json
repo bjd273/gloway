@@ -1,5 +1,5 @@
 {
-  "name": "frontend",
+  "name": "gloway",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -7,13 +7,16 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "vendor:styles": "node scripts/vendor-map-styles.mjs"
   },
   "dependencies": {
+    "@fontsource/inter": "^5.2.8",
     "@mapbox/polyline": "^1.2.1",
     "maplibre-gl": "^5.24.0",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react-dom": "^19.2.7",
+    "zustand": "^5.0.14"
   },
   "devDependencies": {
     "@types/mapbox__polyline": "^1.0.5",

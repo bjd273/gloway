@@ -24,7 +24,8 @@ dependencies = [
     "shapely>=2.0.3",
     "anthropic>=0.21.3",
     "openai>=1.14.2",
-    "greenlet (>=3.5.3,<4.0.0)"
+    "greenlet (>=3.5.3,<4.0.0)",
+    "duckdb (>=1.5.4,<2.0.0)"
 ]
 
 [tool.poetry]
@@ -38,20 +39,35 @@ black = "^24.3.0"
 ruff = "^0.3.4"
 mypy = "^1.9.0"
 
+# Week 17-18 GNN work only needs torch + torch-geometric; the rest of the
+# Phase 3 stack stays in the (heavier) ml group until its weeks arrive.
+[tool.poetry.group.gnn]
+optional = true
+
+[tool.poetry.group.gnn.dependencies]
+torch = ">=2.6"            # first release with official cp313 macOS-arm64 wheels
+torch-geometric = ">=2.6"  # pure-python wheel
+
+# RL stack: preference embeddings (qdrant-client, Week 19-20) + the PPO
+# training pipeline (gymnasium/stable-baselines3/mlflow, Week 21-22). ray is
+# NOT here — the training script uses SB3-PPO, not rllib, which also avoids
+# ray's py3.13/arm64 wheel gaps.
+[tool.poetry.group.rl]
+optional = true
+
+[tool.poetry.group.rl.dependencies]
+qdrant-client = ">=1.8.2"
+stable-baselines3 = ">=2.4.0"  # 2.2.1 predates cp313 wheels
+gymnasium = ">=0.29.1"
+mlflow = ">=2.11.1"
+
 [tool.poetry.group.ml]
 optional = true
 
 [tool.poetry.group.ml.dependencies]
-torch = ">=2.2.1"
-torchvision = ">=0.17.1"
-torch-geometric = ">=2.5.2"
-stable-baselines3 = ">=2.2.1"
-gymnasium = ">=0.29.1"
 ray = {version = ">=2.10.0", extras = ["rllib"]}
 flwr = ">=1.8.0"
 faster-whisper = ">=1.0.1"
-mlflow = ">=2.11.1"
-qdrant-client = ">=1.8.2"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

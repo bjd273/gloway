@@ -7,6 +7,9 @@ token.json
 # OSM data downloads (regenerate via data/download_osm.sh)
 data/osm/*.pbf
 
+# Overture places extract (regenerate via data/download_overture.sh)
+data/overture/*.parquet*
+
 # Valhalla build output (regenerate via docker compose)
 valhalla/custom_files/*
 !valhalla/custom_files/.gitkeep
@@ -21,3 +24,11 @@ data/tile_weights.tsv.gz
 __pycache__/
 *.pyc
 .venv/
+
+# RL training artifacts (trained policies + experiment tracking, regenerate via
+# backend/scripts/train_rl.py)
+backend/models/
+backend/mlruns/
+backend/mlruns.db
+backend/mlartifacts/
+tensorboard_logs/

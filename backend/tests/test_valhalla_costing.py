@@ -64,6 +64,47 @@ def test_out_of_range_prefs_are_clamped():
     assert 0.0 <= a["use_tolls"] <= 1.0
 
 
+class _CapturingClient:
+    """Minimal httpx.AsyncClient stand-in that records the posted body."""
+
+    def __init__(self):
+        self.last_payload: dict | None = None
+
+    async def post(self, url, content=None, headers=None):
+        import json as _json
+
+        self.last_payload = _json.loads(content)
+
+        class _Resp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"trip": {"summary": {"time": 1, "length": 1}, "legs": []}}
+
+        return _Resp()
+
+    async def aclose(self):
+        pass
+
+
+async def test_bicycle_mode_omits_auto_costing_options():
+    client = _CapturingClient()
+    router = ValhallaRouter("http://unused", client=client)
+    await router.get_route((32.72, -97.13), (32.75, -97.09), costing="bicycle")
+    assert client.last_payload["costing"] == "bicycle"
+    # The pref->cost translation is auto-only; bike/walk must not carry it.
+    assert "costing_options" not in client.last_payload
+
+
+async def test_auto_mode_includes_costing_options():
+    client = _CapturingClient()
+    router = ValhallaRouter("http://unused", client=client)
+    await router.get_route((32.72, -97.13), (32.75, -97.09), costing="auto")
+    assert client.last_payload["costing"] == "auto"
+    assert "auto" in client.last_payload["costing_options"]
+
+
 def _valhalla_reachable() -> bool:
     parsed = urlparse(settings.valhalla_url)
     host, port = parsed.hostname or "localhost", parsed.port or 8002
@@ -95,3 +136,21 @@ async def test_avoid_highways_changes_live_route():
         avoid_summary["time"],
         avoid_summary["length"],
     )
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not _valhalla_reachable(), reason="live Valhalla instance not reachable"
+)
+async def test_bicycle_mode_yields_different_route_than_auto():
+    """Bike costing is answerable on the tiles and differs from driving."""
+    origin = (32.73, -97.11)
+    destination = (32.75, -97.09)
+    async with ValhallaRouter(settings.valhalla_url) as router:
+        auto = await router.get_route(origin, destination, costing="auto")
+        bike = await router.get_route(origin, destination, costing="bicycle")
+
+    # Both return real routes, and bike time differs from driving time.
+    assert auto["trip"]["summary"]["time"] > 0
+    assert bike["trip"]["summary"]["time"] > 0
+    assert auto["trip"]["summary"]["time"] != bike["trip"]["summary"]["time"]

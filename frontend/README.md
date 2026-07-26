@@ -1,32 +1,42 @@
-# React + TypeScript + Vite
+# Gloway frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+Minimal, search-first route planner on MapLibre GL. Light/dark follows the
+system theme; the glowing route is the brand.
 
-Currently, two official plugins are available:
+## Running locally
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Everything below assumes the repo root as working directory.
 
-## React Compiler
+```bash
+# 1. Infra: Postgres, Valhalla (routing, :8002), Martin (basemap tiles, :3001)
+docker compose -f infra/docker-compose.yml --project-directory . up -d postgres valhalla martin
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+# 2. Backend API (:8000)
+poetry --directory backend run uvicorn api.main:app --port 8000
 
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+# 3. Frontend (:3000)
+npm --prefix frontend run dev
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+The Vite dev server proxies `/api/v1/*` to the backend and `/api/tiles/*` to
+Martin — the browser only ever talks to :3000.
+
+## Map styles
+
+Two committed MapLibre styles in `src/styles/`:
+
+- `mapStyleLight.json` — vendored OpenFreeMap "liberty".
+- `mapStyleDark.json` — generated from openmaptiles/dark-matter-gl-style by
+  `npm run vendor:styles` (see `scripts/vendor-map-styles.mjs` for the pinned
+  upstream commit and the transforms applied). Re-run only when bumping the
+  pin; the output is committed so builds never fetch from GitHub.
+
+Both keep the OpenMapTiles attribution requirement intact
+(© OpenMapTiles © OpenStreetMap contributors).
+
+## Coverage
+
+Routing currently covers the Central Arlington, TX extract only —
+`src/lib/region.ts` is the single source of truth the UI uses to filter
+search results and clamp the map. Widen it when bigger OSM extracts are
+built (see `data/download_osm.sh`).

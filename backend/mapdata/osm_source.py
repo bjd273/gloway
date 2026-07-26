@@ -33,6 +33,7 @@ _OSM_TAG_TO_CATEGORY: dict[tuple[str, str], PlaceCategory] = {
     ("amenity", "fuel"): PlaceCategory.FUEL,
     ("amenity", "parking"): PlaceCategory.PARKING,
     ("leisure", "park"): PlaceCategory.PARK,
+    ("amenity", "cafe"): PlaceCategory.CAFE,
     ("amenity", "restaurant"): PlaceCategory.RESTAURANT,
     ("shop", "supermarket"): PlaceCategory.GROCERY,
     ("tourism", "hotel"): PlaceCategory.LODGING,
