@@ -12,6 +12,7 @@ import {
   openConversation,
   replyConversation,
   type ConvoMessage,
+  type ReplyResult,
   type RouteOption,
 } from '../lib/api'
 import { useTripStore } from './useTripStore'

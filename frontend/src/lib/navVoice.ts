@@ -60,10 +60,13 @@ export class NavVoiceController {
   private listening = false
   private closedByUs = false
 
-  constructor(
-    private readonly tripId: string,
-    private readonly handlers: NavVoiceHandlers,
-  ) {}
+  private readonly tripId: string
+  private readonly handlers: NavVoiceHandlers
+
+  constructor(tripId: string, handlers: NavVoiceHandlers) {
+    this.tripId = tripId
+    this.handlers = handlers
+  }
 
   start(): void {
     this.closedByUs = false

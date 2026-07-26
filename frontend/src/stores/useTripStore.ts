@@ -242,8 +242,18 @@ export const useTripStore = create<TripState>((set, get) => {
           driveController = null
           set({ navPhase: 'idle', navProgress: 1, arrived: true })
         },
+        // Real mode only: no fixes means no drive (and no trace to learn
+        // from) — end navigation and say why instead of showing a frozen puck.
+        onGpsError: (message) => {
+          driveController = null
+          set({ navPhase: 'idle', currentPosition: null, navProgress: 0, errorMessage: message })
+        },
       })
       driveController.start()
+      // Note on reroutes: in real mode a post-reroute restart naturally
+      // resumes from the live GPS fix (the device is the source of truth) and
+      // the first fix's nearest-point projection lands navProgress mid-route
+      // correctly. Only the sim replays from the route's start.
     },
 
     stopNavigation() {
