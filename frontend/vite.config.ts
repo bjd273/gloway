@@ -7,6 +7,14 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     port: Number(process.env.PORT) || 3000,
+    // Vite rejects requests whose Host header it doesn't recognise, which
+    // blocks tunnelled hostnames ("Blocked request. This host is not
+    // allowed."). Real GPS and the microphone are secure-context-only, so a
+    // phone can't use http://<lan-ip>:3000 at all — an HTTPS tunnel over this
+    // dev server is how a real Arlington drive gets recorded. Everything the
+    // app needs (API, tiles, voice WebSocket) is proxied through this one
+    // port, so tunnelling it is enough.
+    allowedHosts: ['.trycloudflare.com', '.ngrok-free.app', '.ngrok.io'],
     proxy: {
       // FastAPI backend (routing + geocoding). No rewrite — the backend
       // mounts its routers under /api/v1 already. ws:true forwards the

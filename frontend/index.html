@@ -3,7 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- viewport-fit=cover lets the page extend under the notch/home indicator,
+         which is what makes env(safe-area-inset-*) resolve to real values —
+         without it those insets are always 0 and the panels sit under the
+         system UI. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+    />
     <meta name="description" content="Gloway — the map that learns you." />
     <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7f7f5" />
     <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#0e1118" />

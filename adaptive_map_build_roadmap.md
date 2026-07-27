@@ -1852,7 +1852,9 @@ export const JourneyChat: React.FC<JourneyChatProps> = ({ tripId, onIntentConfir
 
 **Who:** You (faster-whisper + Coqui TTS server), Jonathan (frontend WebSocket)
 
-> **Status (July 2026):** partially superseded. Conversation/debrief voice shipped over plain HTTP instead of this section's design: browser Web Speech + a parallel MediaRecorder capture, with server-side STT via the existing Gemini seam (`POST /api/v1/speech/transcribe`, `backend/api/routes/speech.py`) when the browser engine returns nothing, and browser `SpeechSynthesis` for TTS — no faster-whisper, no Coqui, no new services. The **in-navigation real-time voice loop (the WebSocket endpoint below) remains not started** and is the open item if hands-free interaction during active driving becomes a priority.
+> **Status (July 2026):** superseded in implementation, complete in function. Conversation/debrief voice shipped over plain HTTP instead of this section's design: browser Web Speech + a parallel MediaRecorder capture, with server-side STT via the existing Gemini seam (`POST /api/v1/speech/transcribe`, `backend/api/routes/speech.py`) when the browser engine returns nothing, and browser `SpeechSynthesis` for TTS — no faster-whisper, no Coqui, no new services.
+>
+> The **in-navigation voice loop is also built** (`backend/api/routes/voice.py`, `frontend/src/lib/navVoice.ts`, `frontend/src/components/NavVoice.tsx`) — a real WebSocket held open for the whole drive, with full command parity with the pre-trip reply path (ask ETA, add a stop, switch route, change destination). Two deliberate departures from the sample below: STT stays **clip-based** (one Gemini `transcribe` per push-to-talk utterance, framed as base64 inside a JSON message alongside live nav context) and TTS stays browser-native, because the current `LLMClient` seam has no streaming STT/TTS API. The socket's value here is the persistent session and per-utterance nav context, not audio streaming — so the code below is kept for the phase shape it describes, not as the thing to build.
 
 #### Voice backend service
 
@@ -3115,8 +3117,8 @@ Use this as your weekly check-in. Do not move to the next phase until the curren
 - [x] Message is under 30 words and asks at most one question — enforced by prompt instruction (`PRE_JOURNEY_SYSTEM`), not validated in code
 - [x] User reply is stored in `trip_conversations` table
 - [x] Intent (hurry / explore) extracted from user reply updates route weights (`declared_intent` → `UserRoutingPrefs.urgency`)
-- [ ] Voice input (faster-whisper) transcribes speech correctly — not started (Week 13-14)
-- [ ] Coqui TTS synthesizes response audio and plays in browser — not started (Week 13-14)
+- [x] Voice input transcribes speech correctly — **built with a different engine than planned**: the browser's Web Speech API, with a parallel `MediaRecorder` capture that uploads to `POST /api/v1/speech/transcribe` (`backend/api/routes/speech.py` → the Gemini `LLMClient` seam) whenever the browser engine returns an empty transcript. No faster-whisper. The server fallback is load-bearing, not decorative — Chrome's engine returns nothing on the dev machine, so in practice the Gemini path is the one that runs; debug there first
+- [x] Response audio synthesizes and plays in the browser — **browser `SpeechSynthesis`** (`frontend/src/lib/voice.ts`), gated by `useVoiceStore.autoSpeak` and auto-enabled the first time the mic is used. No Coqui service, no new container
 - [x] Post-trip debrief message is sent after trip completion — built here, ahead of its original Week 15-16 slot (`debrief/open` + `debrief/reply`)
 - [x] Gemini extracts structured preference signals from post-trip conversation (`interpret_debrief`, confidence-gated the same way as the pre-journey extractor)
 - [ ] Celery task processes trip completion and updates `trips.implicit_signals` — done **synchronously** instead: `debrief/reply` writes `implicit_signals.debrief` and `reward_value` inline, in the same request. No Celery/Redis async processing exists yet; revisit only if profiling shows the extraction call needs to leave the request path
@@ -3149,12 +3151,22 @@ Use this as your weekly check-in. Do not move to the next phase until the curren
 Two separate fixes, both landed: the user-embedding dims are now resampled per episode during base training (measured `0.00000000` → `0.0204` weight movement — see the Week 21-22 note), and route ranking is served by a **supervised scorer** rather than by reshaping the router's state to match the policy's. The 128 graph-embedding dims remain constant and are documented-as-deferred; they need a trained encoder, which nothing currently depends on. See the Week 27-28 note for the built design.
 
 ### Integration
+
+> **Read this before picking an item.** These are ordered by dependency, not by the list below. An
+> **HTTPS origin is a hard prerequisite for collecting any real drive data at all** — `watchPosition`
+> and `getUserMedia` are secure-context-only, so a phone loading `http://<laptop-lan-ip>:3000` gets
+> neither GPS nor microphone, no matter how good the rest of the app is. Until that is solved, every
+> drive is a simulated one, and a simulated drive replays the suggested route's own coordinates, so
+> `adherence_rate` is 1.0 by construction and the implicit reward carries no information. The scorer's
+> 30-trip threshold, "second trip reflects learned preference", and the whole personalization thesis
+> are all downstream of an HTTPS URL and a phone-usable UI.
+
 - [ ] Full end-to-end test passes: signup → route → drive → feedback → preference update
 - [ ] Second trip for same user reflects preference learned in first trip
 - [ ] Voice pipeline latency is under 1 second end-to-end (transcribe + LLM + TTS)
-- [ ] App works on mobile browser (responsive design)
+- [ ] App works on mobile browser (responsive design) — the layout is already mobile-first (`.trip-panel` is a bottom sheet under 768px), but safe-area insets and `dvh` sizing are missing, which puts "Start drive" under the iPhone home indicator
 - [ ] All API endpoints have basic error handling and return meaningful errors
-- [ ] Staging environment deployed and accessible via public URL
+- [ ] Staging environment deployed and accessible via public URL — a `cloudflared` quick tunnel over the dev server is the cheap interim that unblocks real drives; note it publishes an unauthenticated API, so it is a supervised-test-drive tool, not a standing environment
 
 ### Phase 4 — Mobile App (Capacitor)
 - [ ] Responsive web app verified on real mobile browsers (the Integration item above) — the Capacitor foundation

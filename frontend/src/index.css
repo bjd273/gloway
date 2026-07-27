@@ -38,7 +38,10 @@ html,
 body,
 #root {
   margin: 0;
+  /* dvh so the app tracks the live viewport as mobile browser chrome slides
+     in and out; the 100% keeps desktop and older browsers unchanged. */
   height: 100%;
+  height: 100dvh;
   overflow: hidden;
 }
 
@@ -47,6 +50,10 @@ body {
   background: var(--bg);
   color: var(--text);
   -webkit-font-smoothing: antialiased;
+  /* Suppress the grey flash iOS/Android paint over every tapped control —
+     the app has its own hover/active styling. */
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: none;
 }
 
 .map-container {
@@ -78,8 +85,8 @@ body {
 /* --- wordmark --- */
 .wordmark {
   position: absolute;
-  top: 14px;
-  left: 14px;
+  top: max(14px, env(safe-area-inset-top));
+  left: max(14px, env(safe-area-inset-left));
   z-index: 20;
   display: flex;
   align-items: center;
@@ -99,7 +106,8 @@ body {
 /* --- prompt bar --- */
 .prompt-shell {
   position: absolute;
-  top: 14px;
+  /* Clears the notch / status bar — see the viewport-fit note in index.html. */
+  top: max(14px, env(safe-area-inset-top));
   left: 50%;
   transform: translateX(-50%);
   z-index: 30;
@@ -321,13 +329,22 @@ body {
   z-index: 25;
   left: 12px;
   right: 12px;
-  bottom: 12px;
-  max-height: 42vh;
+  /* Clear the home indicator. At 12px the action row ("Start drive") lands
+     under it on a notched iPhone and cannot be tapped — which matters most
+     in exactly the situation the app is for, a phone in a car mount. */
+  bottom: max(12px, env(safe-area-inset-bottom));
+  /* dvh, not vh: mobile browser chrome shows and hides while driving, and vh
+     is frozen at the largest viewport, so the panel got clipped as the bar
+     came back. */
+  max-height: 42dvh;
   padding: 16px;
   display: flex;
   flex-direction: column;
   gap: 12px;
   overflow: hidden;
+  /* Scrolling the step list shouldn't rubber-band the whole page over a
+     moving map. */
+  overscroll-behavior: contain;
 }
 
 @media (min-width: 768px) {
@@ -336,7 +353,7 @@ body {
     right: auto;
     bottom: 14px;
     width: 330px;
-    max-height: min(60vh, 560px);
+    max-height: min(60dvh, 560px);
   }
 }
 
@@ -401,6 +418,12 @@ body {
   cursor: pointer;
   padding: 2px 4px;
   border-radius: 999px;
+  /* Was ~19x15px — too small to hit in a moving car. */
+  min-width: 32px;
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .trip-via-remove:hover {
@@ -476,11 +499,11 @@ body {
 /* --- preferences (gear + popover) --- */
 .prefs-button {
   position: absolute;
-  top: 14px;
-  right: 14px;
+  top: max(14px, env(safe-area-inset-top));
+  right: max(14px, env(safe-area-inset-right));
   z-index: 30;
-  width: 40px;
-  height: 40px;
+  width: 44px;
+  height: 44px;
   border-radius: 999px;
   display: flex;
   align-items: center;
@@ -494,16 +517,33 @@ body {
   color: var(--text);
 }
 
+/* Phone: a bottom sheet, like .trip-panel. A 260px box pinned to the top-right
+   corner is a mouse-and-desktop shape — on a phone it crowds the notch and
+   puts its controls at the far end of a thumb's reach. */
 .prefs-panel {
   position: absolute;
-  top: 62px;
-  right: 14px;
   z-index: 30;
-  width: 260px;
+  left: 12px;
+  right: 12px;
+  bottom: max(12px, env(safe-area-inset-bottom));
+  max-height: 70dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 14px 16px;
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+@media (min-width: 768px) {
+  .prefs-panel {
+    top: 62px;
+    right: 14px;
+    bottom: auto;
+    left: auto;
+    width: 260px;
+    max-height: min(70dvh, 620px);
+  }
 }
 
 .prefs-title {
@@ -565,6 +605,9 @@ body {
   justify-content: space-between;
   font-size: 14px;
   cursor: pointer;
+  /* The label wraps the switch, so the whole row is the tap target — give it
+     a thumb-sized height rather than the switch's bare 21px. */
+  min-height: 44px;
 }
 
 .pref-row input {
@@ -710,6 +753,13 @@ body {
   line-height: 1;
   cursor: pointer;
   padding: 7px 8px;
+  /* Thumb-sized: these are the hands-free controls, so they get tapped while
+     driving. The glyph stays the same size; only the hit area grows. */
+  min-width: 44px;
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border-radius: 999px;
 }
 
