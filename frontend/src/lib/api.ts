@@ -377,13 +377,20 @@ export async function streamGpsPoints(
   }
 }
 
-export async function completeTrip(tripId: string): Promise<void> {
+export async function completeTrip(
+  tripId: string,
+  durationMinutes?: number | null,
+): Promise<void> {
   let response: Response
   try {
     response = await fetch(`/api/v1/trips/${tripId}/complete`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
+      // duration_minutes feeds the reward's "arrived early/late" term; omitted
+      // when we have nothing truthful to report (see driveDurationMinutes).
+      body: JSON.stringify(
+        durationMinutes != null ? { duration_minutes: durationMinutes } : {},
+      ),
     })
   } catch {
     throw new FriendlyError(ENGINE_DOWN_MESSAGE)

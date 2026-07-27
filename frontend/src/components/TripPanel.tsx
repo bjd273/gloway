@@ -59,13 +59,15 @@ export function TripPanel() {
   const [note, setNote] = useState('')
   const [wrapUpError, setWrapUpError] = useState<string | null>(null)
 
-  // Reaching the destination auto-opens the debrief wrap-up.
+  // Reaching the destination auto-opens the debrief wrap-up. The controller
+  // has already flushed its tail before firing `arrived`, so completing here
+  // scores against the full trace.
   useEffect(() => {
     if (arrived && !wrappingUp) {
       clearArrived()
       setWrappingUp(true)
       if (tripId) {
-        completeTrip(tripId).catch(() => {})
+        completeTrip(tripId, useTripStore.getState().driveDurationMinutes()).catch(() => {})
         void openDebrief(tripId)
       }
     }
@@ -83,14 +85,17 @@ export function TripPanel() {
     return null
   }
 
-  function startWrapUp() {
+  async function startWrapUp() {
     setWrappingUp(true)
-    if (tripId) {
-      // Mark it done right away; the debrief/note can still fail separately
-      // without un-completing the trip.
-      completeTrip(tripId).catch(() => {})
-      void openDebrief(tripId)
-    }
+    if (!tripId) return
+    // Stop the drive first and wait for its final GPS flush. This used to only
+    // call completeTrip: "Done driving?" left the drive streaming, so the trip
+    // was scored against a partial trace while more points were still arriving.
+    const duration = useTripStore.getState().driveDurationMinutes()
+    await stopNavigation()
+    // The debrief/note can still fail separately without un-completing the trip.
+    completeTrip(tripId, duration).catch(() => {})
+    void openDebrief(tripId)
   }
 
   function endWrapUp() {
@@ -224,10 +229,8 @@ export function TripPanel() {
                 </div>
                 <button
                   className="trip-chip trip-chip--active trip-nav-arrive"
-                  onClick={() => {
-                    stopNavigation()
-                    startWrapUp()
-                  }}
+                  // startWrapUp stops the drive itself, flush included.
+                  onClick={() => void startWrapUp()}
                 >
                   Arrive
                 </button>
@@ -258,7 +261,7 @@ export function TripPanel() {
                 <button className="trip-start" onClick={startNavigation}>
                   Start drive
                 </button>
-                <button className="trip-done" onClick={startWrapUp}>
+                <button className="trip-done" onClick={() => void startWrapUp()}>
                   Done driving?
                 </button>
               </div>

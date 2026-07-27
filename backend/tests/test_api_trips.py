@@ -149,6 +149,86 @@ async def test_complete_without_gps_keeps_neutral_default(client):
 
 @pytest.mark.integration
 @requires_stack
+async def test_late_gps_upgrades_the_neutral_placeholder(client):
+    """Completion that outran the drive's final flush heals on the next touch.
+
+    This is the shape of the bug that left `implicit` null on every trip in the
+    database: the client fired POST /complete while its last GPS batch was
+    still in flight, the trace was too short to score, and the neutral 0.0 was
+    frozen in place because completion was terminal. Points arriving afterwards
+    must still produce a real reward.
+    """
+    trip_id = (await client.post("/api/v1/routing/route", json=_ROUTE_BODY)).json()["trip_id"]
+    try:
+        # Completion wins the race — nothing to score against yet.
+        await client.post(f"/api/v1/trips/{trip_id}/complete", json={})
+        stale = await _fetch_trip_row(trip_id)
+        assert stale["implicit_signals"]["reward_source"] == "default_neutral"
+        assert "implicit" not in stale["implicit_signals"]
+
+        # The tail batch lands a moment later.
+        await client.post(
+            f"/api/v1/trips/{trip_id}/gps-update",
+            json={
+                "points": [
+                    {"lat": 32.7205, "lon": -97.1295},
+                    {"lat": 32.7220, "lon": -97.1280},
+                    {"lat": 32.7240, "lon": -97.1265},
+                ]
+            },
+        )
+
+        # A retried completion now scores the full trace instead of no-op'ing.
+        again = await client.post(f"/api/v1/trips/{trip_id}/complete", json={})
+        assert again.status_code == 200
+        healed = await _fetch_trip_row(trip_id)
+        assert healed["implicit_signals"]["reward_source"] == "implicit_only"
+        assert healed["implicit_signals"]["implicit"]["adherence_rate"] is not None
+        assert healed["reward_value"] != 0.0
+        # Still idempotent about the timestamp itself.
+        assert str(healed["completed_at"]) == str(stale["completed_at"])
+    finally:
+        await _delete_trip(trip_id)
+
+
+@pytest.mark.integration
+@requires_stack
+async def test_explicit_reward_is_never_downgraded_by_a_retried_complete(client):
+    """A reward carrying the user's own words outranks a behavioral-only one."""
+    trip_id = (await client.post("/api/v1/routing/route", json=_ROUTE_BODY)).json()["trip_id"]
+    try:
+        await client.post(f"/api/v1/trips/{trip_id}/complete", json={})
+
+        # Stand in for a debrief having written an explicit reward.
+        from db.session import get_session_factory
+
+        async with get_session_factory()() as session:
+            await session.execute(
+                text(
+                    "UPDATE trips SET reward_value = 0.9,"
+                    " implicit_signals = implicit_signals"
+                    " || '{\"reward_source\": \"explicit_only\"}'::jsonb"
+                    " WHERE id = :id"
+                ),
+                {"id": trip_id},
+            )
+            await session.commit()
+
+        await client.post(
+            f"/api/v1/trips/{trip_id}/gps-update",
+            json={"points": [{"lat": 32.7205, "lon": -97.1295}, {"lat": 32.724, "lon": -97.126}]},
+        )
+        await client.post(f"/api/v1/trips/{trip_id}/complete", json={})
+
+        row = await _fetch_trip_row(trip_id)
+        assert row["reward_value"] == 0.9
+        assert row["implicit_signals"]["reward_source"] == "explicit_only"
+    finally:
+        await _delete_trip(trip_id)
+
+
+@pytest.mark.integration
+@requires_stack
 async def test_on_route_trace_scores_higher_than_off_route(client):
     """Following the suggested route yields higher adherence + reward than
     veering far off it."""

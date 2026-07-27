@@ -139,6 +139,26 @@ def _valhalla_eta_minutes(suggested_route: dict) -> float | None:
         return None
 
 
+def ensure_implicit_signals(trip) -> dict | None:
+    """The trip's implicit-signal block, computing it if it isn't there yet.
+
+    Completion can win a race against the drive's final GPS flush: the client
+    marks the trip done while the tail batch is still in flight, so
+    compute_implicit_signals() sees a trace too short to judge and returns {}.
+    The trace is whole moments later, but nothing ever looked again — every
+    trip in the database carried a null adherence as a result.
+
+    So every later touch point (a retried complete, the post-trip debrief)
+    calls this instead of reading the stored block directly. Already computed
+    -> returned as-is; missing -> computed now, against the full trace.
+    Returns None when there is still nothing usable to compute from.
+    """
+    stored = (trip.implicit_signals or {}).get("implicit")
+    if stored:
+        return stored
+    return compute_implicit_signals(trip) or None
+
+
 def compute_implicit_signals(trip) -> dict:
     """Full implicit-signal dict for a completed Trip, or {} when there's no
     usable GPS trace (caller then keeps the neutral default).

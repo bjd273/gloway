@@ -23,6 +23,11 @@ let driveController: DriveController | null = null
 // resolveDriveMode (real when geolocation exists, sim otherwise).
 const DRIVE_MODE_KEY = 'gloway:driveMode'
 
+// Wall-clock start of the current drive, for the duration the completion
+// endpoint scores the reward's time term against. Module-scoped like
+// driveController — it's a timestamp, not rendered state.
+let navStartedAt: number | null = null
+
 function initialDriveMode(): DriveMode {
   if (new URLSearchParams(window.location.search).get('sim') === '1') return 'sim'
   const stored = localStorage.getItem(DRIVE_MODE_KEY)
@@ -89,6 +94,9 @@ interface TripState {
   setMode(mode: TravelMode): void
   /** Switch how the next drive is sourced (Live GPS vs Simulated). */
   setDriveMode(mode: DriveMode): void
+  /** Minutes elapsed on the drive just finished, for the completion endpoint's
+   * time term — or null when there's nothing honest to report. */
+  driveDurationMinutes(): number | null
   /** Begin streaming the drive along the selected route. */
   startNavigation(): void
   /** Stop streaming (manual "Arrive" or trip cleared). */
@@ -253,13 +261,23 @@ export const useTripStore = create<TripState>((set, get) => {
       set({ driveMode: mode })
     },
 
+    driveDurationMinutes() {
+      // Sim drives take a fixed ~36s regardless of route length, so reporting
+      // that would hand every simulated trip the same large "arrived early"
+      // bonus — a constant, not a signal. Only a real drive's clock means
+      // anything; sim leaves the time term at its neutral default.
+      if (navStartedAt === null || get().driveMode !== 'real') return null
+      return (Date.now() - navStartedAt) / 60_000
+    },
+
     startNavigation() {
       const { routes, selectedIndex, tripId, origin, navPhase } = get()
       if (navPhase === 'navigating' || !tripId) return
       const coords = routes[selectedIndex]?.coords ?? []
       if (coords.length < 2) return
 
-      driveController?.stop()
+      void driveController?.stop()
+      navStartedAt = Date.now()
       set({ navPhase: 'navigating', navProgress: 0, arrived: false, currentPosition: origin })
       driveController = new DriveController(tripId, coords, {
         onPosition: (p) => set({ currentPosition: { lng: p.lng, lat: p.lat, label: 'You' } }),
@@ -283,12 +301,15 @@ export const useTripStore = create<TripState>((set, get) => {
       // correctly. Only the sim replays from the route's start.
     },
 
-    stopNavigation() {
-      driveController?.stop()
+    async stopNavigation() {
+      const controller = driveController
       driveController = null
       if (get().navPhase === 'navigating') {
         set({ navPhase: 'idle', currentPosition: null, navProgress: 0 })
       }
+      // Await the final flush so a caller that completes the trip next does so
+      // with the whole trace already server-side (see DriveController.stop).
+      await controller?.stop()
     },
 
     armReroute() {

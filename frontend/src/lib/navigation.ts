@@ -187,16 +187,22 @@ export class DriveController {
     if (this.done) return
     this.done = true
     this.clearSources()
-    void this.flush()
-    this.handlers.onArrive()
+    // Flush the tail BEFORE announcing arrival. onArrive() is what triggers
+    // POST /complete, and completion scores adherence against whatever has
+    // landed server-side — so a fire-and-forget flush here raced the request
+    // and the last seconds of the drive (often the whole trace) arrived too
+    // late to count. `.finally` so a failed flush still ends the drive.
+    void this.flush().finally(() => this.handlers.onArrive())
   }
 
-  /** Stop streaming without firing onArrive (user ended the drive manually). */
-  stop(): void {
+  /** Stop streaming without firing onArrive (user ended the drive manually).
+   * Resolves once the final batch has been sent, so callers can complete the
+   * trip knowing the server has the full trace. */
+  async stop(): Promise<void> {
     if (this.done) return
     this.done = true
     this.clearSources()
-    void this.flush()
+    await this.flush()
   }
 
   private clearSources(): void {

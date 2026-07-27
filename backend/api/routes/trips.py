@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from db.models import Trip
 from db.session import get_db
 from ml.rl.reward_engine import compute_final_reward
-from services.signal_processor import compute_implicit_signals
+from services.signal_processor import ensure_implicit_signals
 
 router = APIRouter()
 
@@ -96,15 +96,14 @@ async def complete_trip(
     trip_id: str, request: CompleteRequest, db: AsyncSession = Depends(get_db)
 ):
     trip = await _load_trip(db, trip_id)
-    if trip.completed_at is not None:
-        # Idempotent: a retried tap shouldn't overwrite the first completion.
-        return {"trip_id": trip_id, "completed_at": str(trip.completed_at)}
+    already_complete = trip.completed_at is not None
 
-    trip.completed_at = func.now()
     signals = dict(trip.implicit_signals or {})
-    client_summary = request.model_dump(exclude_none=True)
-    if client_summary:
-        signals["client_summary"] = client_summary
+    if not already_complete:
+        trip.completed_at = func.now()
+        client_summary = request.model_dump(exclude_none=True)
+        if client_summary:
+            signals["client_summary"] = client_summary
     # Make client_summary visible to compute_implicit_signals (it reads the
     # trip's own signals for the reported duration) before we compute.
     trip.implicit_signals = signals
@@ -112,17 +111,26 @@ async def complete_trip(
     # Behavioral signals from the GPS trace vs the suggested route. Empty when
     # there's no usable trace (short/abandoned trips) — then keep the neutral
     # default so every completed trip still has a reward for Phase 3.
-    implicit = compute_implicit_signals(trip)
+    #
+    # Run on the retried path too, not just the first completion: the client's
+    # final GPS flush can land after the first complete() (see
+    # ensure_implicit_signals), and a trip whose trace only became usable
+    # afterwards should still get a real reward rather than keeping the
+    # placeholder forever.
+    implicit = ensure_implicit_signals(trip)
     if implicit:
         signals["implicit"] = implicit
 
-    if trip.reward_value is None:
-        # A real implicit reward when we have one; neutral 0.0 otherwise. The
-        # debrief reply later fuses this with explicit feedback if the user
-        # talks about the trip.
-        fused = compute_final_reward(implicit or None, None)
+    # Recompute when there's no reward yet, or when the stored one is the
+    # neutral placeholder written before the trace arrived. A `fused` or
+    # `explicit_only` reward already carries the user's own words — never
+    # overwrite that with a behavioral-only score.
+    if trip.reward_value is None or signals.get("reward_source") == "default_neutral":
+        fused = compute_final_reward(implicit, None)
         trip.reward_value = fused["reward"]
-        signals["reward_source"] = "default_neutral" if fused["source"] == "neutral" else fused["source"]
+        signals["reward_source"] = (
+            "default_neutral" if fused["source"] == "neutral" else fused["source"]
+        )
 
     # Fresh dict so SQLAlchemy's JSONB change-tracking fires.
     trip.implicit_signals = dict(signals)

@@ -590,6 +590,78 @@ async def test_debrief_reply_writes_reward_and_applies_prefs(client):
 
 @pytest.mark.integration
 @requires_db
+async def test_debrief_recomputes_implicit_signals_that_completion_missed(client):
+    """The debrief heals a trip completed before its GPS trace landed.
+
+    Production sequence, not a hypothetical: the client fired POST /complete
+    while the drive's last GPS batch was still in flight, so completion saw no
+    usable trace and wrote the neutral placeholder with no `implicit` block.
+    By debrief time the trace is whole, so the reward must fuse behavioral and
+    explicit signal rather than degrading to explicit-only.
+    """
+    from api.main import app
+    from api.routes.conversation import _llm
+
+    fake = FakeLLMClient(
+        opener="How did it go?",
+        extraction={
+            "reward_delta": 0.8,
+            "preference_updates": {},
+            "assistant_reply": "Good to hear.",
+            "confidence": 0.9,
+        },
+    )
+    app.dependency_overrides[_llm] = _override_llm(fake)
+
+    trip_id = await _make_trip()
+    try:
+        # 1. Completion wins the race against the final flush.
+        await client.post(f"/api/v1/trips/{trip_id}/complete", json={})
+        from db.session import get_session_factory
+
+        async with get_session_factory()() as session:
+            stale = (
+                await session.execute(
+                    text("SELECT implicit_signals FROM trips WHERE id = :id"), {"id": trip_id}
+                )
+            ).scalar_one()
+        assert stale["reward_source"] == "default_neutral"
+        assert "implicit" not in stale
+
+        # 2. The tail batch arrives afterwards.
+        await client.post(
+            f"/api/v1/trips/{trip_id}/gps-update",
+            json={
+                "points": [
+                    {"lat": 32.7205, "lon": -97.1295},
+                    {"lat": 32.7220, "lon": -97.1280},
+                ]
+            },
+        )
+
+        # 3. The debrief recomputes rather than trusting the stale block.
+        await client.post(f"/api/v1/trips/{trip_id}/debrief/open")
+        await client.post(
+            f"/api/v1/trips/{trip_id}/debrief/reply", json={"text": "that was great"}
+        )
+
+        async with get_session_factory()() as session:
+            reward_value, signals = (
+                await session.execute(
+                    text("SELECT reward_value, implicit_signals FROM trips WHERE id = :id"),
+                    {"id": trip_id},
+                )
+            ).one()
+        assert "implicit" in signals, "debrief should have recomputed the missing block"
+        assert signals["reward_source"] == "fused"
+        # Confidence-weighted: implicit 0.0 @0.6 fused with explicit 0.8 @0.9.
+        assert reward_value == pytest.approx((0.6 * 0.0 + 0.9 * 0.8) / 1.5)
+    finally:
+        await _cleanup(trip_ids=[trip_id])
+
+
+@pytest.mark.integration
+@requires_db
 async def test_debrief_low_confidence_drops_prefs(client):
     from api.main import app
     from api.routes.conversation import _llm

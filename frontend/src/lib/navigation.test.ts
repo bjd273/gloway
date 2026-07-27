@@ -127,7 +127,7 @@ describe('DriveController real mode', () => {
     expect(handlers.onArrive).not.toHaveBeenCalled()
   })
 
-  it('arrives only near the final coordinate, then flushes the tail', async () => {
+  it('arrives only near the final coordinate, and not before the tail flush', async () => {
     const geo = new FakeGeo()
     const handlers = makeHandlers()
     new DriveController('trip-4', ROUTE, handlers, 'real', geo).start()
@@ -137,11 +137,37 @@ describe('DriveController real mode', () => {
 
     vi.advanceTimersByTime(1100)
     geo.emit(32.72, -97.12) // exactly the final coordinate
-    expect(handlers.onArrive).toHaveBeenCalledTimes(1)
-    expect(geo.cleared).toContain(42) // watch released
+    expect(geo.cleared).toContain(42) // watch released immediately
+
+    // Ordering is load-bearing, not incidental: onArrive triggers POST
+    // /complete, which scores route adherence against whatever GPS has reached
+    // the server. Announcing arrival before the tail flush landed is what left
+    // `implicit` null on every trip in the database — the trip was completed
+    // and scored while its last points were still in flight.
+    expect(handlers.onArrive).not.toHaveBeenCalled()
 
     await vi.advanceTimersByTimeAsync(0)
-    expect(flushed.batches.flat().length).toBeGreaterThan(0) // arrival flushed the buffer
+    expect(flushed.batches.flat().length).toBeGreaterThan(0)
+    expect(handlers.onArrive).toHaveBeenCalledTimes(1)
+  })
+
+  it('stop() resolves only after the final batch is sent', async () => {
+    const geo = new FakeGeo()
+    const handlers = makeHandlers()
+    const controller = new DriveController('trip-8', ROUTE, handlers, 'real', geo)
+    controller.start()
+
+    geo.emit(32.72, -97.13)
+    vi.advanceTimersByTime(1100)
+    geo.emit(32.72, -97.128)
+
+    // Nothing has been flushed yet — the 3s timer hasn't fired.
+    expect(flushed.batches).toHaveLength(0)
+
+    // Awaiting stop() is what lets TripPanel complete the trip knowing the
+    // server has the whole trace ("Done driving?" used to skip this entirely).
+    await controller.stop()
+    expect(flushed.batches.flat()).toHaveLength(2)
   })
 
   it('throttles fix bursts to one per second', () => {

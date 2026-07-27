@@ -35,6 +35,7 @@ from ml.llm.conversation import (
 )
 from ml.llm.factory import get_llm_client
 from ml.rl.reward_engine import compute_final_reward
+from services.signal_processor import ensure_implicit_signals
 
 router = APIRouter()
 
@@ -382,12 +383,17 @@ async def reply_debrief(
     except LLMUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
-    # Fuse the explicit sentiment with any implicit GPS reward already computed
-    # at completion. No implicit signal (e.g. debrief before/without a drive) ->
-    # fusion degrades to explicit-only, i.e. the raw reward_delta.
+    # Fuse the explicit sentiment with the implicit GPS reward. Computed at
+    # completion normally, but recomputed here when it's missing — completion
+    # can outrun the drive's final GPS flush, and by debrief time the trace is
+    # whole. No usable trace at all (debrief before/without a drive) -> fusion
+    # degrades to explicit-only, i.e. the raw reward_delta.
     signals = dict(trip.implicit_signals or {})
+    implicit = ensure_implicit_signals(trip)
+    if implicit:
+        signals["implicit"] = implicit
     explicit = {"reward_delta": result.reward_delta, "confidence": result.confidence}
-    fused = compute_final_reward(signals.get("implicit"), explicit)
+    fused = compute_final_reward(implicit, explicit)
     trip.reward_value = fused["reward"]
     signals["debrief"] = {
         "reward_delta": result.reward_delta,
