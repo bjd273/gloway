@@ -3161,8 +3161,8 @@ Two separate fixes, both landed: the user-embedding dims are now resampled per e
 > 30-trip threshold, "second trip reflects learned preference", and the whole personalization thesis
 > are all downstream of an HTTPS URL and a phone-usable UI.
 
-- [ ] Full end-to-end test passes: signup → route → drive → feedback → preference update
-- [ ] Second trip for same user reflects preference learned in first trip
+- [x] Full end-to-end test passes: signup → route → drive → feedback → preference update — `backend/tests/test_full_journey.py`, against live Valhalla + Postgres with the LLM faked. The GPS trace is sampled from the route's own decoded geometry, so adherence is a real measurement and the trip's reward comes back `fused` rather than explicit-only
+- [x] Second trip for same user reflects preference learned in first trip — same test. It asserts on the **preference weights the second routing call is made with** (`avoid_highways` 0.0 → 1.0) rather than diffing the returned polyline: over a small extract two routes can legitimately be identical, so geometry would be a flaky proxy for the thing being claimed. Confirmed to fail if the stored-preference lookup is severed
 - [ ] Voice pipeline latency is under 1 second end-to-end (transcribe + LLM + TTS)
 - [ ] App works on mobile browser (responsive design) — the layout is already mobile-first (`.trip-panel` is a bottom sheet under 768px), but safe-area insets and `dvh` sizing are missing, which puts "Start drive" under the iPhone home indicator
 - [ ] All API endpoints have basic error handling and return meaningful errors
