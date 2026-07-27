@@ -1,4 +1,5 @@
-version: "3.9"
+# No `version:` key — Compose v2 ignores it and warns on every invocation,
+# which buried the useful output of scripts/drive.sh.
 services:
   postgres:
     image: postgis/postgis:16-3.4
@@ -24,7 +25,12 @@ services:
     ports:
       - "8002:8002"
     environment:
-      - use_tiles_ignore_pbf=True
+      # True (default) loads the cached valhalla_tiles.tar and ignores any .pbf
+      # in custom_files, so restarts are near-instant. Set False to force the
+      # entrypoint to rebuild tiles from the .pbf — which is what
+      # scripts/rebuild_region.sh does after re-cropping to a new bounding box.
+      # Overridable via env so a rebuild never has to rewrite this file.
+      - use_tiles_ignore_pbf=${VALHALLA_USE_CACHED_TILES:-True}
 
   martin:
     image: ghcr.io/maplibre/martin:latest

@@ -1,0 +1,10 @@
+{
+  "id": "arlington-tx",
+  "description": "All of Arlington, TX — the area Valhalla tiles, the Martin basemap and Overture places are built for.",
+  "bbox": {
+    "west": -97.22,
+    "south": 32.6,
+    "east": -97.03,
+    "north": 32.82
+  }
+}
