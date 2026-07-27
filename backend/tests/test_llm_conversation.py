@@ -6,7 +6,6 @@ Postgres without any network or token spend. One requires_llm smoke test at
 the bottom talks to the real provider (single tiny completion) and skips when
 no key is configured.
 """
-import json
 import socket
 import uuid
 
@@ -15,7 +14,7 @@ import pytest
 from sqlalchemy import text
 
 from config import settings
-from ml.llm.base import LLMClient, LLMUnavailable
+from tests.fakes import DownLLMClient, FakeLLMClient, override_llm
 
 
 def _reachable(host: str, port: int) -> bool:
@@ -32,27 +31,6 @@ requires_db = pytest.mark.skipif(
 requires_llm = pytest.mark.skipif(
     not settings.gemini_api_key, reason="requires GEMINI_API_KEY"
 )
-
-
-class FakeLLMClient(LLMClient):
-    """Returns canned responses; json_mode requests get the extraction payload."""
-
-    def __init__(self, opener: str = "In a hurry today, or shall we cruise?",
-                 extraction: dict | None = None):
-        self.opener = opener
-        self.last_json_prompt: str | None = None
-        self.extraction = extraction or {
-            "intent": "hurry",
-            "preference_updates": {"avoid_highways": True},
-            "assistant_reply": "Fastest way it is.",
-            "confidence": 0.9,
-        }
-
-    async def complete(self, system, messages, max_tokens=256, json_mode=False):
-        if json_mode:
-            self.last_json_prompt = messages[-1]["content"]
-            return json.dumps(self.extraction)
-        return self.opener
 
 
 class FakeMapDataSource:
@@ -88,15 +66,7 @@ class EmptyMapDataSource(FakeMapDataSource):
         self.addresses = []
 
 
-class DownLLMClient(LLMClient):
-    async def complete(self, system, messages, max_tokens=256, json_mode=False):
-        raise LLMUnavailable("provider down")
-
-
-def _override_llm(fake: LLMClient):
-    async def _dep():
-        yield fake
-    return _dep
+_override_llm = override_llm  # kept as the local name the tests below already use
 
 
 @pytest.fixture
