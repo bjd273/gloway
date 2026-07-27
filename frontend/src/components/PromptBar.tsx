@@ -154,7 +154,11 @@ export function PromptBar() {
         <div className="prompt-responses" role="listbox">
           {suggestions.map((s, i) => (
             <button
-              key={`${s.lat},${s.lon}`}
+              // Index, not coordinates: the merged Overture + Nominatim
+              // geocoder can return distinct places at identical lat/lon
+              // ("Levitt Pavilion"). The list is rebuilt wholesale per query
+              // and never reorders, so the index is stable enough.
+              key={i}
               role="option"
               aria-selected={i === highlighted}
               className={
