@@ -140,7 +140,17 @@ class ValhallaRouter:
         prefs: Optional[UserRoutingPrefs] = None,
         alternatives: int = 3,                 # always request alternates for RL training data
         costing: str = "auto",                 # "auto" | "bicycle" | "pedestrian"
+        costing_overrides: Optional[dict] = None,
     ) -> dict:
+        """`costing_overrides` are merged over the preference-derived options.
+
+        This is how routing.candidate_generator asks for a deliberately
+        different route ("no highways", "fewest turns") without discarding the
+        user's own preferences — a strategy leans the result, it does not
+        replace the person. Applies to any costing, since bike and pedestrian
+        have their own useful knobs (use_roads, use_lit) even though the
+        preference translation below is auto-only.
+        """
         if prefs is None:
             prefs = UserRoutingPrefs()
 
@@ -165,6 +175,9 @@ class ValhallaRouter:
         # bike/pedestrian costing mappings that don't exist yet.
         if costing == "auto":
             payload["costing_options"] = self._build_costing_options(prefs)
+        if costing_overrides:
+            options = payload.setdefault("costing_options", {}).setdefault(costing, {})
+            options.update(costing_overrides)
 
         response = await self._client.post(
             f"{self.base_url}/route",
