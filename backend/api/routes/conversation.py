@@ -392,12 +392,19 @@ async def reply_debrief(
     implicit = ensure_implicit_signals(trip)
     if implicit:
         signals["implicit"] = implicit
-    explicit = {"reward_delta": result.reward_delta, "confidence": result.confidence}
+    # reward_confidence, not confidence: the latter scores preference_updates
+    # and is 0 whenever the reply implies no durable setting, which silently
+    # zero-weighted the user's own sentiment out of the fused reward.
+    explicit = {
+        "reward_delta": result.reward_delta,
+        "confidence": result.reward_confidence,
+    }
     fused = compute_final_reward(implicit, explicit)
     trip.reward_value = fused["reward"]
     signals["debrief"] = {
         "reward_delta": result.reward_delta,
-        "confidence": result.confidence,
+        "confidence": result.confidence,                 # about preference_updates
+        "reward_confidence": result.reward_confidence,   # about reward_delta
         "preference_updates": result.preference_updates,
     }
     signals["fusion"] = fused

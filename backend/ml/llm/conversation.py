@@ -328,11 +328,16 @@ Respond with ONLY valid JSON matching:
     "prefer_scenic": true | false
   },
   "assistant_reply": "...",       // under 15 words, warm, no question
-  "confidence": 0.0-1.0           // confidence in preference_updates
+  "confidence": 0.0-1.0,          // confidence in preference_updates ONLY
+  "reward_confidence": 0.0-1.0    // separately: how clearly did they express satisfaction?
 }
 
 "That was lovely / smooth / great" => reward_delta ~0.8. "Traffic was awful / hated it" => reward_delta ~-0.8.
-"The scenic way was nice, let's do that more" => prefer_scenic true. "Too many highways" => avoid_highways true."""
+"The scenic way was nice, let's do that more" => prefer_scenic true. "Too many highways" => avoid_highways true.
+
+The two confidences are independent and usually differ. "Good, but I went my own way
+through campus" is a clear opinion about the trip (reward_confidence high) that implies
+no durable setting (confidence 0). Judge them separately — never copy one into the other."""
 
 
 @dataclass
@@ -341,6 +346,14 @@ class DebriefInterpretation:
     preference_updates: dict = field(default_factory=dict)
     assistant_reply: str = "Thanks for the feedback."
     confidence: float = 0.0
+    # Confidence in reward_delta, NOT in preference_updates. These were one
+    # field until a real drive exposed the conflation: the rider said "good,
+    # but I came through UT Arlington which was faster and safer for biking" —
+    # a clear opinion that implied no durable preference, so `confidence` was
+    # 0.0, and the fusion weight took that 0 and discarded the sentiment
+    # entirely. Any debrief that doesn't also yield a durable preference hit
+    # this, which is most of them.
+    reward_confidence: float = 0.0
 
 
 async def generate_debrief_question(
@@ -381,6 +394,13 @@ Extract the reward signal and any durable preferences, and acknowledge."""
     reward = float(data.get("reward_delta") or 0.0)
     reward = max(-1.0, min(1.0, reward))
     confidence = float(data.get("confidence") or 0.0)
+    # Fall back to `confidence` only when the model omits the field entirely
+    # (older prompt, or a provider that dropped it) — a stated 0.0 is honoured.
+    raw_reward_conf = data.get("reward_confidence")
+    reward_confidence = float(
+        confidence if raw_reward_conf is None else raw_reward_conf
+    )
+    reward_confidence = max(0.0, min(1.0, reward_confidence))
     updates_raw = data.get("preference_updates") or {}
     updates = {
         k: bool(v)
@@ -395,4 +415,5 @@ Extract the reward signal and any durable preferences, and acknowledge."""
         preference_updates=updates,
         assistant_reply=reply,
         confidence=confidence,
+        reward_confidence=reward_confidence,
     )
