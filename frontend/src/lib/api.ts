@@ -22,6 +22,38 @@ export interface ParsedRoute {
   minutes: number
   miles: number
   steps: RouteStep[]
+  /**
+   * Display name from the backend — "Fastest", "No highways", "Another way".
+   * NOT unique: every Valhalla alternate is labelled "Another way", so this is
+   * never a React key and never a dedupe key. Use the array index.
+   */
+  label: string
+  /**
+   * Machine key — "avoid_highways", "fewest_turns". Optional because a backend
+   * older than the route_strategies field omits it. Prefer this over matching
+   * `label`, which is display copy and expected to get reworded.
+   */
+  strategy?: string
+  /**
+   * Valhalla emits these on the trip summary only on some builds and costings,
+   * so `undefined` means "not known", which is NOT the same as `false`. Only
+   * ever use them to add a claim, never to deny one.
+   */
+  hasHighway?: boolean
+  hasToll?: boolean
+  /**
+   * Whether a routing strategy purpose-built this route, or it is one of the
+   * alternates Valhalla returned alongside one. False means `label` is the
+   * generic "Another way" and carries no information — see `routeLabels`.
+   * Optional because a backend older than the `route_primary` field omits it;
+   * treat missing as true, which reproduces the previous behaviour.
+   */
+  isPrimary?: boolean
+  /**
+   * The road this route spends the most distance on — "Cooper St", "I-30".
+   * Undefined when Valhalla emitted no street names for this costing.
+   */
+  viaRoad?: string
 }
 
 export interface TripResult {
@@ -71,16 +103,61 @@ interface ValhallaManeuver {
   instruction: string
   length: number
   time: number
+  // Present only when Valhalla knows the road's name — unnamed service roads
+  // and slip lanes have none, so this is routinely absent mid-route.
+  street_names?: string[]
+}
+
+/**
+ * The road a route mostly runs on, for a "via Cooper St" style name.
+ *
+ * Weighted by distance, not by maneuver count: a route with eight fiddly turns
+ * through a neighbourhood and one long run down a highway is "via the highway"
+ * to any driver looking at it, but counting maneuvers would name a side street.
+ *
+ * The first and last maneuvers are excluded deliberately. Every candidate for
+ * the same trip leaves from the same street and arrives on the same street, so
+ * those two contribute nothing that distinguishes one route from another — and
+ * on a short trip they are often the longest legs, which is exactly when they'd
+ * win and make every card read the same.
+ */
+export function dominantStreet(maneuvers: ValhallaManeuver[]): string | undefined {
+  const middle = maneuvers.slice(1, -1)
+  const byStreet = new Map<string, number>()
+  for (const m of middle) {
+    // A maneuver can carry several names for one road (a street name plus its
+    // route number). Crediting each with the full length is fine — they're
+    // alternatives for the same stretch, competing with other roads, not with
+    // each other.
+    for (const name of m.street_names ?? []) {
+      byStreet.set(name, (byStreet.get(name) ?? 0) + m.length)
+    }
+  }
+  let best: string | undefined
+  let bestLength = 0
+  for (const [name, length] of byStreet) {
+    if (length > bestLength) {
+      bestLength = length
+      best = name
+    }
+  }
+  return best
 }
 
 interface ValhallaTrip {
   legs: { shape: string; maneuvers: ValhallaManeuver[] }[]
-  summary: { time: number; length: number }
+  summary: { time: number; length: number; has_highway?: boolean; has_toll?: boolean }
 }
 
-function parseTrip(trip: ValhallaTrip): ParsedRoute {
+function parseTrip(
+  trip: ValhallaTrip,
+  label: string,
+  strategy?: string,
+  isPrimary?: boolean,
+): ParsedRoute {
   const coords: [number, number][] = []
   const steps: RouteStep[] = []
+  const maneuvers: ValhallaManeuver[] = []
   for (const leg of trip.legs) {
     // Valhalla encodes shapes at polyline precision 6.
     for (const [lat, lng] of polyline.decode(leg.shape, 6)) {
@@ -88,6 +165,7 @@ function parseTrip(trip: ValhallaTrip): ParsedRoute {
     }
     for (const m of leg.maneuvers) {
       steps.push({ text: m.instruction, miles: m.length, seconds: m.time })
+      maneuvers.push(m)
     }
   }
   return {
@@ -95,6 +173,14 @@ function parseTrip(trip: ValhallaTrip): ParsedRoute {
     minutes: trip.summary.time / 60,
     miles: trip.summary.length,
     steps,
+    label,
+    strategy,
+    isPrimary,
+    viaRoad: dominantStreet(maneuvers),
+    // Passed through as-is: undefined must stay undefined so callers can tell
+    // "no highway" from "don't know".
+    hasHighway: trip.summary.has_highway,
+    hasToll: trip.summary.has_toll,
   }
 }
 
@@ -146,9 +232,24 @@ export async function getRoute(request: {
     throw new FriendlyError(OUT_OF_AREA_MESSAGE)
   }
   const data = await response.json()
+  // route_labels / route_strategies / route_primary are index-parallel to
+  // routes. All are additive fields, so fall back rather than assuming they
+  // arrived.
+  const labels = (data.route_labels as string[] | undefined) ?? []
+  const strategies = (data.route_strategies as string[] | undefined) ?? []
+  const primary = (data.route_primary as boolean[] | undefined) ?? []
   return {
     tripId: data.trip_id,
-    routes: (data.routes as ValhallaTrip[]).map(parseTrip),
+    routes: (data.routes as ValhallaTrip[]).map((trip, i) =>
+      parseTrip(
+        trip,
+        labels[i] ?? (i === 0 ? 'Fastest' : 'Another way'),
+        strategies[i],
+        // Missing means an older backend: treat every route as purpose-built,
+        // which reproduces the pre-route_primary behaviour exactly.
+        primary[i] ?? true,
+      ),
+    ),
     recommendedIndex: data.recommended_index,
   }
 }
@@ -247,6 +348,8 @@ export interface RouteOption {
   index: number
   minutes: number
   selected: boolean
+  /** The name shown on the card, so "avoid the highway" can resolve to an index. */
+  label?: string
 }
 
 export interface ReplyResult {

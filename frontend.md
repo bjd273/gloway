@@ -158,10 +158,51 @@ safety property when the user is in a car. Also cheap: one CSS pass.
 
 ## Status
 
-- [ ] 1. Route cards: label, delta, reason, collapse beyond three, colour-matched to map
-- [ ] 2. Single bottom sheet with peek/half/full snap points; chat reduced to one bar
-- [ ] 3. Home/work address search + "use current location"
-- [ ] 4. Gradient reduced to the single primary action
+- [x] 1. Route cards: label, delta, reason, collapse beyond three, colour-matched to map
+- [x] 2. Single bottom sheet with peek/half/full snap points; chat reduced to one bar
+- [x] 3. Home/work address search + "use current location"
+- [x] 4. Gradient reduced to the single primary action
+
+### What shipped, and where it differs from the plan above
+
+All four landed (July 2026). Four deviations worth recording, because each was a
+decision rather than an oversight:
+
+**Colour-matching is binary plus hover, not one hue per route.** Six coloured lines is the
+cluttered map-app look this project is explicitly not, and it breaks "anything the user hasn't
+chosen renders grey". Instead each card carries a short line-swatch in the *actual* colour its
+polyline is drawn in — gradient when selected, grey when not — and pointing at a card (or
+tab-focusing it) brightens and thickens that line on the map. Preview-before-commit, without a
+second palette. `lib/routeColors.ts` is the single source both the CSS and the MapLibre paint
+read from.
+
+**The delta measures against the *recommended* route, not the selected one.** This needed a new
+`recommendedIndex` in the trip store — `requestRoute` used to consume it into `selectedIndex` and
+throw it away. Without it every number reshuffles each time you tap a card.
+
+**`.gw-primary` covers three buttons, not just `.trip-start`.** The action block is a three-way
+switch (pre-drive / navigating / wrap-up) and only ever renders one at a time, so "one gradient
+per screen" still holds. Keeping it literally on `.trip-start` would have left the navigating and
+wrap-up screens with no primary action at all.
+
+**The primary button's gradient was darkened.** White text on `--glow-a` is 1.5:1 — far under AA,
+on the single most important control in a car. `--glow-gradient-legible` (#067f84 → #04565a)
+carries white at 4.8:1 minimum, and the bright cyan returns as a rim highlight so the button still
+reads as lit. The map ribbon still uses the full-range gradient: no text sits on it.
+
+Also fixed in passing: the old search shell spanned the full width at the top and sat *on top of*
+the preferences gear on a 375px phone, so the gear was unclickable. Moving search into the sheet
+removed the overlap.
+
+Follow-ups deliberately not taken:
+
+- **`home_label` / `work_label` on the backend journey model.** Saved places are coordinates only,
+  so `lib/placeLabels.ts` caches the picked name in localStorage. It is device-local and not truth
+  — a new device falls back to showing coordinates. The backend field is the real fix.
+- **Routing the in-drive voice reply through the transient bubble.** `navVoice` never touches
+  `useConvoStore`, so the bubble is pre-trip-only for free. NavVoice's inline text also shows what
+  it *heard*, which the bubble wouldn't, and that path produces the training data — not worth the
+  regression risk.
 
 ---
 

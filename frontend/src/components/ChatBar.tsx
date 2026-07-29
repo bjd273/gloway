@@ -1,8 +1,15 @@
-// The pre-journey conversation — rendered inside the prompt shell once a
-// route is on screen (the surface PromptBar reserved for the Phase 2 layer).
-// One opener from the assistant, replies can re-route the trip (hurry /
-// explore) or persist durable preferences. Invisible when the backend has
-// no LLM configured.
+// The conversation, reduced to one input bar pinned to the sheet.
+//
+// What used to be here — a stacking transcript of bubbles — is gone on purpose.
+// In a map app the assistant's reply *is* the route change: the redrawn line is
+// the answer and the text is only confirmation, so it appears briefly over the
+// map (AssistantBubble) rather than holding permanent screen real estate.
+// `useConvoStore.messages` still holds the full exchange, and the backend holds
+// the real conversation; only the on-screen transcript went away.
+//
+// The open-once, reset-on-idle and text-to-speech effects moved here verbatim
+// from Conversation.tsx — they are load-bearing, particularly the `listening`
+// guard, since TTS and the microphone contend for the audio device.
 import { useEffect, useRef, useState } from 'react'
 
 import { useSpeechRecognition } from '../hooks/useSpeechRecognition'
@@ -11,7 +18,7 @@ import { useConvoStore } from '../stores/useConvoStore'
 import { useTripStore } from '../stores/useTripStore'
 import { useVoiceStore } from '../stores/useVoiceStore'
 
-export function Conversation() {
+export function ChatBar() {
   const tripStatus = useTripStore((s) => s.status)
   const tripId = useTripStore((s) => s.tripId)
   const status = useConvoStore((s) => s.status)
@@ -25,7 +32,6 @@ export function Conversation() {
   const noteVoiceUsed = useVoiceStore((s) => s.noteVoiceUsed)
 
   const [draft, setDraft] = useState('')
-  const endRef = useRef<HTMLDivElement>(null)
   // Index of the last message we've read aloud, so toggling the speaker on
   // doesn't re-read an already-shown message and we only speak new arrivals.
   const spokenUpToRef = useRef(0)
@@ -52,9 +58,6 @@ export function Conversation() {
   useEffect(() => {
     if (tripStatus === 'idle' && status !== 'idle') reset()
   }, [tripStatus, status, reset])
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
-  }, [messages.length, status])
   // Read *new* assistant messages aloud when voice mode is on — covers the
   // opener and every reply ack uniformly, no special-casing per message kind.
   // Guarded so flipping the speaker on never re-reads an old message, and so
@@ -72,6 +75,8 @@ export function Conversation() {
     spokenUpToRef.current = messages.length
   }, [messages, autoSpeak, listening])
 
+  // 'off' means the backend has no LLM configured: render nothing at all rather
+  // than a dead input. The sheet footer must not reserve space for this.
   if (status === 'idle' || status === 'off') return null
 
   function onMicClick() {
@@ -97,27 +102,22 @@ export function Conversation() {
   }
 
   return (
-    <div className="convo">
-      <div className="convo-messages">
-        {status === 'opening' && <div className="convo-bubble convo-bubble--thinking">…</div>}
-        {messages.map((m, i) => (
-          <div
-            key={i}
-            className={`convo-bubble ${m.role === 'user' ? 'convo-bubble--user' : ''}`}
-          >
-            {m.content}
-          </div>
-        ))}
-        {status === 'thinking' && <div className="convo-bubble convo-bubble--thinking">…</div>}
-        <div ref={endRef} />
-      </div>
+    <div className="chat-bar">
       <form className="convo-reply" onSubmit={send}>
         <input
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder={listening ? 'Listening…' : transcribing ? 'Transcribing…' : 'Reply…'}
-          aria-label="Reply to your assistant"
+          placeholder={
+            listening
+              ? 'Listening…'
+              : transcribing
+                ? 'Transcribing…'
+                : status === 'thinking'
+                  ? 'Thinking…'
+                  : 'Ask to change the route…'
+          }
+          aria-label="Ask your assistant to change the route"
           disabled={status !== 'ready'}
         />
         {micSupported && (

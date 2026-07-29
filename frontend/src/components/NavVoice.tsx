@@ -48,6 +48,7 @@ function computeRouteOptions(): RouteOption[] {
     index,
     minutes: route.minutes,
     selected: index === s.selectedIndex,
+    label: route.label,
   }))
 }
 

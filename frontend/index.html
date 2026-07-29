@@ -7,9 +7,13 @@
          which is what makes env(safe-area-inset-*) resolve to real values —
          without it those insets are always 0 and the panels sit under the
          system UI. -->
+    <!-- interactive-widget=resizes-content: the search field and chat bar now
+         sit at the bottom of the viewport, which is exactly where the on-screen
+         keyboard appears. Chromium honours this; iOS relies on dvh, which the
+         layout already uses. -->
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
     />
     <meta name="description" content="Gloway — the map that learns you." />
     <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7f7f5" />

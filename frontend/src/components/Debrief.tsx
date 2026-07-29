@@ -87,11 +87,11 @@ export function Debrief({ onDone }: { onDone: () => void }) {
       </div>
 
       {status === 'done' ? (
-        <button className="trip-chip trip-chip--active" onClick={onDone}>
+        <button className="gw-primary debrief-done" onClick={onDone}>
           Done
         </button>
       ) : (
-        <form className="convo-reply convo-reply--wrapup" onSubmit={send}>
+        <form className="convo-reply" onSubmit={send}>
           <input
             value={draft}
             onChange={(e) => setDraft(e.target.value)}

@@ -98,6 +98,11 @@ describe('DriveController real mode', () => {
     controller.stop()
   })
 
+  // Progress is a fraction of route LENGTH, summed segment by segment, so it
+  // lands a few ulps off the round number this evenly-spaced fixture implies
+  // (0.49999999999928946 for the midpoint). closeTo, not exact equality: the
+  // sum is the honest measure and chasing exactness here would only mean
+  // rounding the value the map's `line-progress` consumes.
   it('derives progress from nearest-point projection, not elapsed time', () => {
     const geo = new FakeGeo()
     const handlers = makeHandlers()
@@ -105,13 +110,13 @@ describe('DriveController real mode', () => {
 
     // A fix right at the route's midpoint => progress 0.5, immediately.
     geo.emit(32.72, -97.125)
-    expect(handlers.onProgress).toHaveBeenLastCalledWith(0.5)
+    expect(handlers.onProgress).toHaveBeenLastCalledWith(expect.closeTo(0.5, 6))
 
     // A later fix that has NOT advanced (driver deviated sideways) parks
     // progress at the nearest on-route point rather than inventing motion.
     vi.advanceTimersByTime(1100)
     geo.emit(32.7235, -97.125) // ~390m north of the same midpoint
-    expect(handlers.onProgress).toHaveBeenLastCalledWith(0.5)
+    expect(handlers.onProgress).toHaveBeenLastCalledWith(expect.closeTo(0.5, 6))
   })
 
   it('resumes mid-route after a reroute restart (fix lands at the right progress)', () => {
@@ -123,7 +128,7 @@ describe('DriveController real mode', () => {
     new DriveController('trip-3', ROUTE, handlers, 'real', geo).start()
 
     geo.emit(32.72, -97.123) // at coords[7] of 0..10
-    expect(handlers.onProgress).toHaveBeenLastCalledWith(0.7)
+    expect(handlers.onProgress).toHaveBeenLastCalledWith(expect.closeTo(0.7, 6))
     expect(handlers.onArrive).not.toHaveBeenCalled()
   })
 
