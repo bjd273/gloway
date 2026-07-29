@@ -51,9 +51,22 @@ class RouteResponse(BaseModel):
     estimated_minutes: float
     context_summary: str
     # Plain-language name for each candidate ("Fewest turns", "No highways"),
-    # parallel to `routes`. Additive: the frontend ignores it today and can
-    # label the "Other ways to go" chips with it later.
+    # parallel to `routes`. Note these are NOT unique: every Valhalla alternate
+    # is labelled "Another way", so clients must key on index, not label.
     route_labels: list[str] = Field(default_factory=list)
+    # Machine key for each candidate ("avoid_highways", "fewest_turns"), also
+    # parallel to `routes`. Same values already recorded in
+    # trips.context["route_strategies"]. The frontend picks its per-route
+    # "why" line off this rather than string-matching route_labels, which are
+    # display copy and expected to get reworded.
+    route_strategies: list[str] = Field(default_factory=list)
+    # Whether each candidate is the route its strategy actually optimised for,
+    # parallel to `routes`. False means it is one of the alternates Valhalla
+    # returned alongside that strategy's own route — useful variety, but not
+    # what the strategy asked for, so its label carries no information (they are
+    # all "Another way"). The frontend keys off this to decide whether to show
+    # the strategy's name or to name the route by the road it mostly runs on.
+    route_primary: list[bool] = Field(default_factory=list)
 
 
 def _get_router(request: Request) -> ValhallaRouter:
@@ -177,6 +190,8 @@ async def get_route(
         trip_id=str(trip.id),
         routes=routes,
         route_labels=[c.label for c in candidates],
+        route_strategies=[c.strategy for c in candidates],
+        route_primary=[c.is_primary for c in candidates],
         recommended_index=ranked.recommended_index,
         estimated_minutes=recommended["summary"]["time"] / 60,
         context_summary="Route calculated based on your preferences.",

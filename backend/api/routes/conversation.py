@@ -49,6 +49,11 @@ class RouteOption(BaseModel):
     index: int
     minutes: float
     selected: bool = False
+    # Display name the user is actually looking at ("No highways"), so the
+    # assistant can answer "take the one avoiding the highway" instead of
+    # making the driver translate it into a route number. Optional: older
+    # clients don't send it.
+    label: str | None = None
 
 
 class ReplyRequest(BaseModel):
@@ -240,7 +245,10 @@ async def reply_conversation(
     if convo is None:
         raise HTTPException(status_code=404, detail="no conversation for this trip")
 
-    route_options = [opt.model_dump() for opt in request.route_options or []]
+    # exclude_none so an absent label doesn't write `"label": null` into the
+    # persisted extraction — this record is training data, and a client that
+    # sends no label should round-trip exactly as it did before labels existed.
+    route_options = [opt.model_dump(exclude_none=True) for opt in request.route_options or []]
     try:
         result = await interpret_reply(
             llm, convo.messages, request.text, route_options=route_options or None

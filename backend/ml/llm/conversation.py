@@ -118,6 +118,25 @@ async def generate_pre_journey_message(
     return text.strip()
 
 
+def _route_options_block(route_options: list[dict] | None) -> str:
+    """Render the routes the user is currently looking at, for the prompt.
+
+    `label` is the same display name shown on the route card ("No highways"),
+    so the driver can say "take the one without the highway" and the model can
+    map it to an index. Older clients omit it; fall back to the bare index.
+    """
+    if not route_options:
+        return ""
+    lines = "\n".join(
+        f"  {opt['index']}: "
+        + (f"{opt['label']} — " if opt.get("label") else "")
+        + f"{round(opt['minutes'])} min"
+        + (" (currently selected)" if opt.get("selected") else "")
+        for opt in route_options
+    )
+    return f"\nROUTE OPTIONS:\n{lines}\n"
+
+
 async def interpret_reply(
     client: LLMClient,
     messages: list[dict],
@@ -125,14 +144,7 @@ async def interpret_reply(
     route_options: list[dict] | None = None,
 ) -> ReplyInterpretation:
     transcript = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
-    options_block = ""
-    if route_options:
-        lines = "\n".join(
-            f"  {opt['index']}: {round(opt['minutes'])} min"
-            + (" (currently selected)" if opt.get("selected") else "")
-            for opt in route_options
-        )
-        options_block = f"\nROUTE OPTIONS:\n{lines}\n"
+    options_block = _route_options_block(route_options)
     prompt = f"""CONVERSATION SO FAR:
 {transcript}
 {options_block}
@@ -279,14 +291,7 @@ async def interpret_navigation_reply(
     progress (0..1), minutesRemaining, nextManeuver.
     """
     transcript = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in messages)
-    options_block = ""
-    if route_options:
-        lines = "\n".join(
-            f"  {opt['index']}: {round(opt['minutes'])} min"
-            + (" (currently selected)" if opt.get("selected") else "")
-            for opt in route_options
-        )
-        options_block = f"\nROUTE OPTIONS:\n{lines}\n"
+    options_block = _route_options_block(route_options)
     prompt = f"""{_nav_context_block(nav_context)}
 {options_block}
 CONVERSATION SO FAR:
