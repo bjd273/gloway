@@ -6,16 +6,16 @@
 flowchart LR
     subgraph Client["Frontend — React + MapLibre"]
         MapView
-        PromptBar
-        Conversation
-        TripPanel
-        Stores["Zustand stores\n(useTripStore, useUserStore,\nuseConvoStore, useVoiceStore)"]
+        Sheet["Sheet + TripSheet"]
+        NavVoice
+        Stores["Zustand stores\n(useTripStore, useUserStore, useConvoStore,\nuseDebriefStore, useVoiceStore, useSheetStore)"]
     end
 
     subgraph Backend["Backend — FastAPI (backend/)"]
         Routes["api/routes/*\nrouting · users · trips\nconversation · voice · speech · feedback"]
         MapData["mapdata/\nMapDataSource abstraction"]
-        RoutingClient["routing/valhalla_client.py"]
+        RoutingPkg["routing/\nvalhalla_client · candidate_generator\n· route_ranker"]
+        Signals["services/signal_processor.py\nml/rl/reward_engine.py"]
         LLM["ml/llm/\nLLMClient abstraction"]
         DB["db/\nSQLAlchemy models + async session"]
     end
@@ -32,12 +32,14 @@ flowchart LR
     Client -- "fetch/JSON, WebSocket" --> Routes
     MapView -- "vector tiles" --> Martin
     Routes --> MapData
-    Routes --> RoutingClient
+    Routes --> RoutingPkg
+    Routes --> Signals
     Routes --> LLM
     Routes --> DB
     MapData --> Overpass
     MapData --> OvertureParquet
-    RoutingClient --> Valhalla
+    RoutingPkg --> Valhalla
+    Signals --> DB
     LLM --> Gemini
     DB --> Postgres
 ```
@@ -114,8 +116,15 @@ Every route that touches the LLM depends on `_llm()` (an async generator depende
 | `db/models.py` | SQLAlchemy ORM models (see [Data Flow](data-flow.md) for the schema) | `db.base` |
 | `mapdata/` | Place/address abstraction (above) | external HTTP/duckdb |
 | `routing/valhalla_client.py` | `UserRoutingPrefs` → Valhalla `costing_options` translation, `ValhallaRouter` HTTP client | Valhalla service |
+| `routing/candidate_generator.py` | Sweeps several costing strategies concurrently and de-dupes on geometry, so the ranker chooses between genuinely different routes rather than three variations of one road | `valhalla_client`, `services.signal_processor` (reuses its adherence maths for overlap) |
+| `routing/route_ranker.py` | Scores the candidate pool for a user and returns `recommended_index`; falls back to Valhalla's order with no trained model | `ml.rl.route_scorer`, `ml.rl.state` |
+| `services/signal_processor.py` | GPS trace vs suggested route: adherence rate, deviations, timing — the implicit half of the reward | `db.models.Trip` |
 | `ml/llm/` | LLM provider abstraction (above) + `conversation.py` prompts/extraction | Gemini API |
-| `ml/gnn/` | `ingest.py` (OSM → `road_segments`), `graph_builder.py` (`road_segments` → PyG `Data`), `model.py` (`RoadNetworkEncoder`, a GATv2 graph encoder) | PostGIS, PyTorch Geometric — **not yet wired into any API route**; this is groundwork for the Phase 3 RL state, built and tested in isolation |
+| `ml/rl/reward_engine.py` | Confidence-weighted fusion of implicit (behaviour) and explicit (debrief) reward into `trips.reward_value` — **live**, called from `complete_trip` and `reply_debrief` | `services.signal_processor` |
+| `ml/rl/route_scorer.py`, `state.py` | Supervised scorer predicting a trip's reward from 20 ranking features; trained from logged `reward_value` | scikit-learn |
+| `ml/rl/preference_embedding.py` | 32-dim per-user embedding + Qdrant store | Qdrant — **no production call site**; tests run in-memory |
+| `ml/rl/environment.py`, `train.py` | Gymnasium env + PPO loop for a sequential navigation policy | stable-baselines3, MLflow — **scaffolding**; nothing serves this policy |
+| `ml/gnn/` | `ingest.py` (OSM → `road_segments`), `graph_builder.py` (`road_segments` → PyG `Data`), `model.py` (`RoadNetworkEncoder`, a GATv2 graph encoder) | PostGIS, PyTorch Geometric — **not yet wired into any API route**; groundwork for the Phase 3 RL state, built and tested in isolation. Randomly initialised and never trained, so its 128 dims are currently a constant |
 
 ## Frontend module map
 
@@ -128,30 +137,45 @@ The frontend is intentionally light on components; almost all logic lives in `st
 | `useConvoStore` | Pre-trip conversation open/reply state | `applyReplyResult()` (exported, not store-internal) is the shared side-effect applier — see below. |
 | `useVoiceStore` | Whether assistant replies are read aloud (`autoSpeak`) | Persisted to `localStorage` under `gloway:voice`; auto-enables itself once, the first time the mic is used. |
 | `useDebriefStore` | Post-trip debrief conversation | Mirrors `useConvoStore`'s open/reply shape for the debrief flow. |
+| `useSheetStore` | The bottom sheet's snap (`peek`/`half`/`full`) and its **measured** pixel height | Measured rather than computed from `dvh`, because mobile browser chrome slides in and out while driving and that mapping shifts underneath you. A store rather than props because `MapView` is a *sibling* of the sheet and needs the live height for camera padding. |
+
+The UI is a full-bleed map with glass chrome floating over it: `MapView` at the bottom of the
+stack, then the wordmark, the bottom `Sheet` (whose content is `TripSheet`), the transient
+`AssistantBubble`, and the preferences panel. `TripSheet`'s subtree is **always mounted** and the
+snap height only changes what is visible — unmounting per snap would tear down the WebSocket
+`NavVoice` holds for the duration of a drive.
 
 `stores/useConvoStore.ts`'s exported `applyReplyResult()` function is the single place that turns a backend `ReplyResponse` (or the WebSocket voice `action` payload — same shape) into store mutations: route switch, stop insertion, travel-mode change, destination override, preference sync. Both the HTTP pre-trip reply path and the WebSocket in-drive voice path call it, so a spoken "take me home" mid-drive and a typed "take me home" pre-trip behave identically — see `api/routes/voice.py`'s docstring: *"`action` mirrors the HTTP `ReplyResponse` shape exactly (snake_case), so the frontend reuses the same reply-result parser."*
 
 `lib/api.ts` is the only module that calls `fetch`/opens the WebSocket; every user-facing error string lives there (`FriendlyError`), so components and stores never format raw HTTP details for display.
 
-`lib/navigation.ts`'s `DriveController` simulates a drive along the selected route's decoded polyline (ticking a synthetic position forward, since local dev has no real GPS inside the tiny Arlington tile region) and streams batched points to `/trips/{id}/gps-update` on the same cadence a real device would use `watchPosition` — the docstring is explicit that swapping the synthetic tick for real GPS fixes is the only change needed later; the batching/streaming/puck code downstream is already the production path.
+`lib/navigation.ts`'s `DriveController` is the live position source, with two interchangeable modes behind one pipeline: `real` uses `navigator.geolocation.watchPosition`, and `sim` (selected with `?sim=1`, or automatically when the Geolocation API is missing) walks the route's own coordinates on a timer. Everything downstream — buffering, batched flushes to `/trips/{id}/gps-update`, the puck, the camera, arrival — is identical in both, which is what makes sim an honest stand-in outside the Arlington tile region.
+
+The progress fraction it emits is a fraction of route **length**, computed in `lib/routeProgress.ts`, not of coordinate count. Valhalla packs shape points tightly through curves and spreads them on straights, so the two diverge badly, and the map's `line-progress` gradients address the line by length — see [ADR: distance-based progress](decisions.md#progress-is-a-fraction-of-length-not-of-coordinate-count).
 
 ## Data stores
 
 - **PostgreSQL + PostGIS** — the system of record. See [`db/models.py`](../backend/db/models.py) for the ORM source of truth; schema history lives in `db/migrations/versions/` (Alembic). Tables: `users`, `user_preferences`, `user_journey_profiles`, `trips`, `trip_conversations`, `road_segments`.
 - **Overture Places parquet** (`data/overture/places.parquet`) — a static, locally-generated extract queried in-process via `duckdb`. Not a database service; regenerated via `data/download_overture.sh`.
 - **Valhalla tile graph** (`valhalla/custom_files/`) — the offline-built routing graph, OSM-only regardless of which `MapDataSource` backs places/addresses (see [Map Data Abstraction Layer](../adaptive_map_build_roadmap.md#map-data-abstraction-layer) in the roadmap).
-- Redis/Celery/Qdrant/MLflow appear in `infra/docker-compose.yml` and the roadmap's tech-stack tables as **planned** infrastructure for Phase 2/3 (async signal processing, preference embeddings, experiment tracking) — nothing in the current backend code reads or writes to them yet.
+- **Qdrant** has code that can use it (`ml/rl/preference_embedding.py`) but no production call site; its tests run fully in-memory. **MLflow** is used by the RL training script, which defaults to a local sqlite store rather than the service. **Redis and Celery** appear in `infra/docker-compose.yml` for an async pipeline that was never built — there is no `services/celery_app.py`.
 
 ## What's built vs. what's scaffolding
 
 This matters for anyone extending the system — don't assume roadmap ambition equals shipped behavior:
 
-- **Shipped and wired end-to-end:** routing with preference-driven costing, geocoding/place search, user registration + preferences + journey profile, trip persistence + GPS breadcrumbs + completion, the pre-trip conversation, the post-trip debrief (writes `trips.reward_value`), the in-drive voice WebSocket, server-side STT fallback.
-- **Built and tested, not yet wired into a request path:** `ml/gnn/` (road graph ingestion + GATv2 encoder) — this is Phase 3 (RL) groundwork; nothing in `api/routes/` calls it yet. `UserPreference.preference_vector` and `UserJourneyProfile.driving_persona`/`known_regular_routes` columns exist but nothing currently writes non-null values into them.
-- **Referenced in `docker-compose.yml`/roadmap, not present in backend code at all:** Celery task queue, Redis caching, Qdrant vector store, MLflow tracking, federated learning (Flower), RL training loop (Stable Baselines3/Ray).
+- **Shipped and wired end-to-end:** routing with preference-driven costing; multi-strategy candidate generation and ranking; geocoding/place search; user registration, preferences and journey profile; trip persistence, batched GPS breadcrumbs and completion; live navigation (traveled/remaining route styling, heading-up driving camera, locate control); the pre-trip conversation; the in-drive voice WebSocket; server-side STT fallback; the post-trip debrief; and confidence-weighted reward fusion writing `trips.reward_value`.
+- **Wired but inert until trained:** the supervised route scorer is called on every `POST /route`, but `RouteRanker.from_path()` finds no model until `scripts/train_route_scorer.py` has ≥30 completed trips to learn from, so ranking is behaviour-preserving (Valhalla's own order) in the meantime.
+- **Built and tested, not in any request path:** `ml/gnn/` (road-graph ingestion + GATv2 encoder — and note it is randomly initialised and never trained, so its output is a constant); `ml/rl/environment.py` + `train.py` (a PPO navigation policy that demonstrably learns, but which nothing serves); `ml/rl/preference_embedding.py`. `UserPreference.preference_vector` and `UserJourneyProfile.driving_persona`/`known_regular_routes` columns exist but nothing writes non-null values into them.
+- **Declared in `docker-compose.yml`, absent from the code:** the Celery task queue and Redis caching. Also note `backend` and `celery_worker` cannot build — there is no `backend/Dockerfile`.
+- **In the roadmap only:** federated learning (Flower), dashcam-based map updates.
+
+The single biggest blocker is not modelling. `watchPosition` and `getUserMedia` are secure-context-only, so collecting real drive data at all requires an HTTPS origin (`./scripts/drive.sh`). A simulated drive replays the suggested route's own coordinates, which makes `adherence_rate` 1.0 by construction and the implicit reward information-free.
 
 ## Related pages
 
+- [Setup](setup.md) for getting all of this running.
+- [Backend](backend.md) and [Frontend](frontend.md) for the module-level detail this page summarises.
 - [Data Flow & Sequence Diagrams](data-flow.md) for how a request actually moves through these modules.
 - [API Specification](api.md) for the exact request/response contracts.
 - [Decision Records](decisions.md) for why the abstraction layers, provider choices, and a few subtler fixes (atomic GPS append, Valhalla costing clamping) exist.

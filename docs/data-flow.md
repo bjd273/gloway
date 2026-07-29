@@ -18,15 +18,29 @@ sequenceDiagram
     DB-->>API: avoid_highways / avoid_tolls / prefer_scenic / avoid_left_turns
     Note over API: _load_prefs() builds UserRoutingPrefs;<br/>declared_intent overrides urgency (hurry=1.0, explore=0.2)
     API->>API: _build_costing_options(prefs) — clamped 0..1 values
-    API->>VH: POST /route {locations, costing, costing_options, alternates:3}
-    VH-->>API: {trip: {...}, alternates: [...]}
-    API->>DB: INSERT trips (origin, destination, suggested_route=full Valhalla response, context)
-    API-->>FE: RouteResponse {trip_id, routes[], recommended_index, estimated_minutes}
-    FE->>FE: parseTrip() decodes each leg's polyline6 shape into [lng,lat] coords + steps
-    FE->>U: render primary + alternate routes on the map
+
+    Note over API,VH: candidate_generator.generate_candidates()<br/>skipped under 2 straight-line miles — baseline only
+    par one call per costing strategy, concurrently
+        API->>VH: POST /route (baseline)
+    and
+        API->>VH: POST /route (use_highways: 0)
+    and
+        API->>VH: POST /route (maneuver_penalty, shortest, top_speed, use_tolls: 0)
+    end
+    VH-->>API: each returns {trip, alternates[]}
+    Note over API: pool primaries first, then leftovers;<br/>drop anything ≥0.8 geometry overlap; cap at 6
+
+    API->>API: RouteRanker.rank() — supervised scorer, or<br/>Valhalla's order when no model is trained
+    API->>DB: INSERT trips (origin, destination, suggested_route=every candidate,<br/>context={route_strategies, recommended_index, scores, ...})
+    API-->>FE: RouteResponse {trip_id, routes[], recommended_index,<br/>route_labels[], route_strategies[], route_primary[]}
+    FE->>FE: parseTrip() decodes polyline6 → coords + steps,<br/>and dominantStreet() picks each route's main road
+    FE->>FE: routeLabels() names the set — strategy name, else "via S Cooper St"
+    FE->>U: render selected route (glowing) + alternates (neutral grey)
 ```
 
 Every route request is persisted as a `trips` row **whether or not** anyone consumes it downstream yet — this is the raw material the Phase 3 RL trainer will eventually read (`suggested_route`, `context`, later `actual_path_taken` and `reward_value`). See `api/routes/routing.py`'s module docstring.
+
+The sweep exists because one call is not enough: on a measured Arlington pair, Valhalla's three "alternates" were two copies of one road plus one bad option, so ranking had nothing real to choose between. See [ADR: sweep several costing strategies](decisions.md#sweep-several-costing-strategies-instead-of-trusting-one-valhalla-call).
 
 If Valhalla returns a `4xx` (point outside the tiled region, unroutable), the backend forwards that status with Valhalla's error detail rather than a blind `500`; a `503` is returned if Valhalla is unreachable at all. The frontend maps both into one of two fixed, friendly strings (`ENGINE_DOWN_MESSAGE` / `OUT_OF_AREA_MESSAGE`) — see `lib/api.ts::getRoute`.
 
@@ -34,7 +48,7 @@ If Valhalla returns a `4xx` (point outside the tiled region, unroutable), the ba
 
 ```mermaid
 sequenceDiagram
-    participant FE as Frontend (PromptBar)
+    participant FE as Frontend (PlaceSearchField)
     participant API as GET /api/v1/routing/search
     participant Factory as mapdata.factory
     participant Hybrid as HybridMapDataSource
@@ -125,25 +139,56 @@ sequenceDiagram
 
 `action`'s shape is byte-for-byte the same as the HTTP `ReplyResponse` (snake_case field names preserved over the wire) specifically so the frontend's `applyReplyResult()` handles both without a second parser. The one difference: `reArmDrive: true` tells the trip store to restart the (simulated) drive on the newly-computed route after any reroute, so a mid-drive "take me home" doesn't silently end navigation.
 
-## 5. GPS breadcrumbs during a drive
+## 5. The live drive loop
+
+One position source feeds four consumers plus the backend. `DriveController` has two
+interchangeable modes — `real` (`watchPosition`) and `sim` (walks the route's own coordinates on
+a timer, selected with `?sim=1`) — and everything downstream is identical in both, which is what
+makes sim an honest stand-in outside the tiled region.
 
 ```mermaid
 sequenceDiagram
-    participant DC as DriveController (frontend)
+    participant GPS as Position source<br/>(watchPosition | sim tick)
+    participant DC as DriveController
+    participant Store as useTripStore
+    participant Map as MapView
     participant API as POST .../trips/{id}/gps-update
     participant DB as Postgres
 
-    loop every 800ms
-        DC->>DC: tick() — advance synthetic position, buffer point
+    loop every fix (real: ≥1000ms throttle · sim: 800ms)
+        GPS->>DC: {lat, lng}
+        DC->>DC: project onto nearest route coordinate
+        DC->>Store: onPosition {lng, lat}
+        DC->>Store: onProgress — fraction of route LENGTH, not coordinate count
+        DC->>DC: buffer {lat, lon, timestamp}
+        Store->>Map: currentPosition → move the heading puck
+        Store->>Map: navProgress → setRouteProgress() greys the traveled span
+        Store->>Map: bearingAtFraction() → camera bearing, zoom 16.8, pitch 55
+        Note over Store: also drives TripSheet's progress bar<br/>and NavVoice's spoken remaining time
     end
+
     loop every 3000ms
         DC->>API: flush() — batched points [{lat, lon, timestamp}, ...]
         API->>DB: UPDATE trips SET actual_path_taken =<br/>coalesce(actual_path_taken,'[]') || :new_points
         Note over API,DB: Atomic jsonb append at the DB.<br/>Two concurrent flushes serialize under<br/>the row lock instead of one clobbering<br/>the other (the old read-modify-write bug).
     end
+
+    DC->>DC: within 40m of the final coordinate AND past 90% of the route
+    DC->>API: flush the tail FIRST
+    API-->>DC: ok
+    DC->>Store: onArrive() → triggers POST /complete
 ```
 
-See [ADR: atomic GPS append](decisions.md#atomic-jsonb-append-for-gps-breadcrumbs-not-read-modify-write) for why this is a single `UPDATE ... = col || :new` rather than reading the array into Python, appending, and writing it back.
+Two orderings in there are load-bearing:
+
+- **The tail flush precedes `onArrive`.** `onArrive` triggers `POST /complete`, and completion
+  scores adherence against whatever GPS has reached the server. A fire-and-forget flush raced the
+  request, and the last seconds of every drive — often the whole trace — arrived too late to
+  count, leaving `implicit` null on every trip in the database.
+- **Arrival needs both proximity and progress.** The 90% tail check stops a loop-shaped route
+  (destination near origin) from "arriving" the moment the drive starts.
+
+See [ADR: atomic GPS append](decisions.md#atomic-jsonb-append-for-gps-breadcrumbs-not-read-modify-write) for why the append is a single `UPDATE ... = col || :new` rather than reading the array into Python, appending, and writing it back — and [ADR: distance-based progress](decisions.md#progress-is-a-fraction-of-length-not-of-coordinate-count) for why `onProgress` reports length rather than index.
 
 ## 6. Post-trip debrief → reward signal
 
