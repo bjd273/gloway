@@ -151,6 +151,29 @@ Keep these current with behaviour changes:
 Write about what is actually built. The roadmap is written partly in ambition tense; the wiki is
 not, and the distinction is the whole reason the wiki exists.
 
+### Mermaid diagrams
+
+`docs/architecture.md` and `docs/data-flow.md` contain Mermaid. GitHub renders it, and a syntax
+error shows up as "Unable to render rich display" with a parse error rather than anything you'd
+catch by reading the source. Two traps, both of which have already bitten this repo:
+
+- **`;` is a statement separator in sequence diagrams.** A semicolon anywhere in message or note
+  text truncates the statement, and the error is reported at whatever follows it. Use a comma or
+  a `<br/>`.
+- **ER key constraints are `PK`, `FK`, `UK`** — a composite is `PK, FK`, not `PK_FK`. An invalid
+  token there is reported several lines later, after the parser recovers.
+
+Non-ASCII (`—`, `≥`) is fine in both, in case a parse error tempts you to blame it.
+
+Validate before pushing rather than discovering it on GitHub — extract the fenced blocks and run
+them through the real parser:
+
+```bash
+npm i mermaid jsdom
+# then feed each ```mermaid block to mermaid.parse() under a jsdom global
+```
+
+
 ## A note on headless browsers
 
 The in-editor browser preview **never fires `requestAnimationFrame`**. Three consequences, all of

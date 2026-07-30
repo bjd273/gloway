@@ -16,7 +16,7 @@ sequenceDiagram
     FE->>API: RouteRequest {origin, dest, user_id?, declared_intent?, waypoints, mode}
     API->>DB: SELECT user_preferences WHERE user_id
     DB-->>API: avoid_highways / avoid_tolls / prefer_scenic / avoid_left_turns
-    Note over API: _load_prefs() builds UserRoutingPrefs;<br/>declared_intent overrides urgency (hurry=1.0, explore=0.2)
+    Note over API: _load_prefs() builds UserRoutingPrefs<br/>declared_intent overrides urgency (hurry=1.0, explore=0.2)
     API->>API: _build_costing_options(prefs) — clamped 0..1 values
 
     Note over API,VH: candidate_generator.generate_candidates()<br/>skipped under 2 straight-line miles — baseline only
@@ -28,7 +28,7 @@ sequenceDiagram
         API->>VH: POST /route (maneuver_penalty, shortest, top_speed, use_tolls: 0)
     end
     VH-->>API: each returns {trip, alternates[]}
-    Note over API: pool primaries first, then leftovers;<br/>drop anything ≥0.8 geometry overlap; cap at 6
+    Note over API: pool primaries first, then leftovers<br/>drop anything ≥0.8 geometry overlap, cap at 6
 
     API->>API: RouteRanker.rank() — supervised scorer, or<br/>Valhalla's order when no model is trained
     API->>DB: INSERT trips (origin, destination, suggested_route=every candidate,<br/>context={route_strategies, recommended_index, scores, ...})
@@ -204,7 +204,7 @@ sequenceDiagram
     participant DB as Postgres
 
     FE->>Complete: {duration_minutes?, deviated?}
-    Complete->>DB: trip.completed_at = now(); reward_value = 0.0 (neutral default)<br/>implicit_signals.reward_source = "default_neutral"
+    Complete->>DB: trip.completed_at = now(), reward_value = 0.0 (neutral default)<br/>implicit_signals.reward_source = "default_neutral"
     Note over Complete: Idempotent — a retried tap returns the<br/>existing completed_at rather than overwriting.
 
     FE->>Open: (drive ended, "how was it?")
@@ -215,7 +215,7 @@ sequenceDiagram
     FE->>Reply: {text: driver's reaction}
     Reply->>LLM: interpret_debrief(question, text)
     LLM-->>Reply: {reward_delta, confidence, preference_updates, assistant_reply}
-    Reply->>DB: trip.reward_value = reward_delta<br/>implicit_signals.debrief = {...}; reward_source = "debrief"
+    Reply->>DB: trip.reward_value = reward_delta<br/>implicit_signals.debrief = {...}, reward_source = "debrief"
     opt preference_updates present
         Reply->>DB: UPDATE user_preferences
     end
@@ -239,7 +239,7 @@ erDiagram
         bool onboarding_completed
     }
     user_preferences {
-        uuid user_id PK_FK
+        uuid user_id PK, FK
         bool avoid_highways
         bool avoid_tolls
         bool avoid_left_turns
@@ -248,7 +248,7 @@ erDiagram
         float_array preference_vector "unused today — Phase 3 RL input"
     }
     user_journey_profiles {
-        uuid user_id PK_FK
+        uuid user_id PK, FK
         text_array typical_use_cases
         text_array stated_dislikes
         geography home_location
