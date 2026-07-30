@@ -8,8 +8,13 @@
 import { useEffect, useState } from 'react'
 
 import type { JourneyProfile, LatLon, UserPrefs } from '../lib/api'
+import { LOCATION_FAILURE_MESSAGE, requestCurrentLocation } from '../lib/geolocate'
+import { describePlace, rememberPlaceLabel } from '../lib/placeLabels'
 import { useTripStore } from '../stores/useTripStore'
 import { useUserStore } from '../stores/useUserStore'
+import { PlaceSearchField } from './PlaceSearchField'
+
+type PlaceKey = 'home_location' | 'work_location'
 
 const PREF_ITEMS: { key: keyof UserPrefs; label: string }[] = [
   { key: 'avoid_highways', label: 'Avoid highways' },
@@ -18,7 +23,7 @@ const PREF_ITEMS: { key: keyof UserPrefs; label: string }[] = [
   { key: 'prefer_scenic', label: 'Prefer scenic streets' },
 ]
 
-const PLACES: { key: 'home_location' | 'work_location'; label: string }[] = [
+const PLACES: { key: PlaceKey; label: string }[] = [
   { key: 'home_location', label: 'Home' },
   { key: 'work_location', label: 'Work' },
 ]
@@ -27,12 +32,20 @@ const CONVO_STYLES: JourneyProfile['preferred_convo_style'][] = ['brief', 'chatt
 
 function formatPlace(place: LatLon | null): string {
   if (!place) return 'Not set'
-  return `${place.lat.toFixed(3)}, ${place.lon.toFixed(3)}`
+  // The name the user picked, when this browser still remembers it. The
+  // backend stores coordinates only.
+  return describePlace(place.lat, place.lon)
 }
 
 export function PrefsPanel() {
   const [open, setOpen] = useState(false)
   const [emailInput, setEmailInput] = useState('')
+  /** Which place row is in edit mode, if any. */
+  const [editing, setEditing] = useState<PlaceKey | null>(null)
+  /** Row currently being written — setPlace is not optimistic, so without this
+   *  the button looks dead for the length of the PATCH. */
+  const [savingPlace, setSavingPlace] = useState<PlaceKey | null>(null)
+  const [placeError, setPlaceError] = useState<string | null>(null)
 
   const userId = useUserStore((s) => s.userId)
   const email = useUserStore((s) => s.email)
@@ -52,10 +65,48 @@ export function PrefsPanel() {
     if (open && userId) void loadProfile()
   }, [open, userId, loadProfile])
 
+  // Preferences is itself a bottom sheet, so while it's open the trip sheet
+  // underneath recedes — two stacked sheets read as a mistake. A body attribute
+  // rather than lifted state: nothing else needs to know.
+  useEffect(() => {
+    if (!open) return
+    document.body.dataset.prefsOpen = 'true'
+    return () => {
+      delete document.body.dataset.prefsOpen
+    }
+  }, [open])
+
   async function onRegister(e: React.FormEvent) {
     e.preventDefault()
     if (!emailInput.trim()) return
     await register(emailInput)
+  }
+
+  /** Write one place and close its editor. Label is remembered locally. */
+  async function savePlace(key: PlaceKey, lat: number, lon: number, label?: string) {
+    setPlaceError(null)
+    setSavingPlace(key)
+    if (label) rememberPlaceLabel(lat, lon, label)
+    const saved = await setPlace(key, { lat, lon })
+    setSavingPlace(null)
+    if (saved) setEditing(null)
+  }
+
+  /** "Use my current location" — unlike routing, this one reports failure
+   *  rather than quietly falling back to the map centre, which would save the
+   *  wrong address without saying so.
+   *  (Not named use* — that reads as a React hook to the linter.) */
+  async function saveCurrentLocation(key: PlaceKey) {
+    setPlaceError(null)
+    setSavingPlace(key)
+    const result = await requestCurrentLocation()
+    if (!result.ok) {
+      setSavingPlace(null)
+      setPlaceError(LOCATION_FAILURE_MESSAGE[result.reason])
+      return
+    }
+    setSavingPlace(null)
+    await savePlace(key, result.place.lat, result.place.lng, 'Current location')
   }
 
   async function onToggle(key: keyof UserPrefs) {
@@ -116,28 +167,77 @@ export function PrefsPanel() {
               <span className="prefs-title">Your places</span>
               {PLACES.map(({ key, label }) => {
                 const place = journey?.[key] ?? null
-                return (
-                  <div key={key} className="place-row">
-                    <span className="place-label">{label}</span>
-                    <span className="place-value">{formatPlace(place)}</span>
-                    <button
-                      className="place-action"
-                      onClick={() => {
-                        const c = useTripStore.getState().mapCenter
-                        void setPlace(key, { lat: c.lat, lon: c.lng })
-                      }}
-                    >
-                      Use map center
-                    </button>
-                    {place && (
+                const isEditing = editing === key
+                const isSaving = savingPlace === key
+
+                if (!isEditing) {
+                  return (
+                    <div key={key} className="place-row">
+                      <span className="place-label">{label}</span>
+                      <span className="place-value">{formatPlace(place)}</span>
                       <button
-                        className="place-action place-action--clear"
-                        aria-label={`Clear ${label.toLowerCase()}`}
-                        onClick={() => void setPlace(key, null)}
+                        className="place-action"
+                        onClick={() => {
+                          setPlaceError(null)
+                          setEditing(key)
+                        }}
                       >
-                        ✕
+                        {place ? 'Change' : 'Set'}
                       </button>
-                    )}
+                      {place && (
+                        <button
+                          className="place-action place-action--clear"
+                          aria-label={`Clear ${label.toLowerCase()}`}
+                          onClick={() => void setPlace(key, null)}
+                        >
+                          ✕
+                        </button>
+                      )}
+                    </div>
+                  )
+                }
+
+                return (
+                  <div key={key} className="place-edit">
+                    <span className="place-label">{label}</span>
+                    <PlaceSearchField
+                      placeholder={`Search for your ${label.toLowerCase()} address`}
+                      ariaLabel={`Search for your ${label.toLowerCase()} address`}
+                      autoFocus
+                      onPick={(result, title) =>
+                        void savePlace(key, result.lat, result.lon, title)
+                      }
+                    >
+                      <div className="place-edit-actions">
+                        <button
+                          className="place-action"
+                          disabled={isSaving}
+                          onClick={() => void saveCurrentLocation(key)}
+                        >
+                          {isSaving ? 'Locating…' : '📍 Current location'}
+                        </button>
+                        <button
+                          className="place-action"
+                          disabled={isSaving}
+                          onClick={() => {
+                            const c = useTripStore.getState().mapCenter
+                            void savePlace(key, c.lat, c.lng)
+                          }}
+                        >
+                          Map center
+                        </button>
+                        <button
+                          className="place-action"
+                          onClick={() => {
+                            setEditing(null)
+                            setPlaceError(null)
+                          }}
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </PlaceSearchField>
+                    {placeError && <div className="prefs-error">{placeError}</div>}
                   </div>
                 )
               })}

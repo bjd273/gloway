@@ -1,14 +1,14 @@
-// The "Where to?" bar — Gloway's front door. It geocodes while you're
-// choosing a destination; once a trip is set, the same shell hosts the
-// Phase 2 conversation layer (see Conversation.tsx) — the surface never
-// had to move, as designed.
+// Address search, shared by the sheet's destination field and the home/work
+// rows in settings. Both live inside an already-glass surface, so the field is
+// a solid pill and the results a flat list — glass on glass reads as mud.
+//
+// Extracted so the two can't drift: the debounce, the abort-on-retype, the
+// out-of-region handling and the keyboard model are subtle enough that a
+// second copy would quietly diverge.
 import { useEffect, useRef, useState } from 'react'
 
 import { searchPlaces, type SearchResult } from '../lib/api'
 import { inRegion, OUT_OF_AREA_MESSAGE } from '../lib/region'
-import { useTripStore } from '../stores/useTripStore'
-import { useUserStore } from '../stores/useUserStore'
-import { Conversation } from './Conversation'
 
 interface Suggestion extends SearchResult {
   pickable: boolean
@@ -20,23 +20,27 @@ function splitName(displayName: string): { title: string; detail: string } {
   return { title, detail: rest.slice(0, 3).join(', ') }
 }
 
-export function PromptBar() {
+interface Props {
+  placeholder: string
+  ariaLabel: string
+  autoFocus?: boolean
+  /** Rendered between the field and the results when nothing is being searched. */
+  children?: React.ReactNode
+  onPick(result: SearchResult, title: string): void
+}
+
+export function PlaceSearchField({
+  placeholder,
+  ariaLabel,
+  autoFocus,
+  children,
+  onPick,
+}: Props) {
   const [query, setQuery] = useState('')
   const [suggestions, setSuggestions] = useState<Suggestion[]>([])
   const [isSearching, setIsSearching] = useState(false)
   const [highlighted, setHighlighted] = useState(0)
   const abortRef = useRef<AbortController | null>(null)
-
-  const destination = useTripStore((s) => s.destination)
-  const origin = useTripStore((s) => s.origin)
-  const setDestination = useTripStore((s) => s.setDestination)
-  const clearTrip = useTripStore((s) => s.clearTrip)
-  const journey = useUserStore((s) => s.journey)
-
-  const savedPlaces = [
-    { key: 'home' as const, label: 'Home', icon: '🏠', place: journey?.home_location ?? null },
-    { key: 'work' as const, label: 'Work', icon: '💼', place: journey?.work_location ?? null },
-  ].filter((p) => p.place)
 
   // Debounced search-as-you-type.
   useEffect(() => {
@@ -52,9 +56,7 @@ export function PromptBar() {
     const timer = setTimeout(async () => {
       try {
         const results = await searchPlaces(query.trim(), controller.signal)
-        setSuggestions(
-          results.map((r) => ({ ...r, pickable: inRegion(r.lat, r.lon) })),
-        )
+        setSuggestions(results.map((r) => ({ ...r, pickable: inRegion(r.lat, r.lon) })))
         setHighlighted(0)
       } catch {
         if (!controller.signal.aborted) setSuggestions([])
@@ -70,7 +72,7 @@ export function PromptBar() {
 
   function pick(s: Suggestion) {
     if (!s.pickable) return
-    setDestination({ lat: s.lat, lng: s.lon, label: splitName(s.display_name).title })
+    onPick(s, splitName(s.display_name).title)
     setQuery('')
     setSuggestions([])
   }
@@ -85,10 +87,10 @@ export function PromptBar() {
       setHighlighted((h) => Math.max(h - 1, 0))
     } else if (e.key === 'Enter') {
       e.preventDefault()
-      const firstPickable = suggestions[highlighted]?.pickable
+      const target = suggestions[highlighted]?.pickable
         ? suggestions[highlighted]
         : suggestions.find((s) => s.pickable)
-      if (firstPickable) pick(firstPickable)
+      if (target) pick(target)
     } else if (e.key === 'Escape') {
       setSuggestions([])
     }
@@ -97,61 +99,24 @@ export function PromptBar() {
   const anyPickable = suggestions.some((s) => s.pickable)
   const showDropdown = query.trim().length >= 3 && (suggestions.length > 0 || !isSearching)
 
-  // Destination set: collapse to a trip header.
-  if (destination) {
-    return (
-      <div className="prompt-shell">
-        <div className="prompt-bar prompt-bar--set">
-          <span className="prompt-dest">
-            <span className="prompt-dest-dot" />
-            {destination.label ?? 'Destination'}
-          </span>
-          <button className="prompt-clear" onClick={clearTrip} aria-label="Clear trip">
-            ✕
-          </button>
-        </div>
-        {origin && (
-          <div className="prompt-from">
-            from <strong>{origin.label ?? 'Starting point'}</strong> — drag either pin to adjust
-          </div>
-        )}
-        <Conversation />
-      </div>
-    )
-  }
-
   return (
-    <div className="prompt-shell">
-      <div className="prompt-bar">
+    <>
+      <div className="place-search-bar">
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyDown={onKeyDown}
-          placeholder="Where to?"
-          aria-label="Where to?"
-          autoFocus
+          placeholder={placeholder}
+          aria-label={ariaLabel}
+          autoFocus={autoFocus}
         />
         {isSearching && <span className="prompt-spinner" aria-hidden />}
       </div>
 
-      {!showDropdown && savedPlaces.length > 0 && (
-        <div className="prompt-shortcuts">
-          {savedPlaces.map(({ key, label, icon, place }) => (
-            <button
-              key={key}
-              className="prompt-shortcut"
-              onClick={() =>
-                setDestination({ lat: place!.lat, lng: place!.lon, label })
-              }
-            >
-              <span aria-hidden>{icon}</span> {label}
-            </button>
-          ))}
-        </div>
-      )}
+      {!showDropdown && children}
 
       {showDropdown && (
-        <div className="prompt-responses" role="listbox">
+        <div className="place-results" role="listbox">
           {suggestions.map((s, i) => (
             <button
               // Index, not coordinates: the merged Overture + Nominatim
@@ -159,6 +124,7 @@ export function PromptBar() {
               // ("Levitt Pavilion"). The list is rebuilt wholesale per query
               // and never reorders, so the index is stable enough.
               key={i}
+              type="button"
               role="option"
               aria-selected={i === highlighted}
               className={
@@ -189,6 +155,6 @@ export function PromptBar() {
           )}
         </div>
       )}
-    </div>
+    </>
   )
 }

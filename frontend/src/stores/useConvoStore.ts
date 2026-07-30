@@ -141,6 +141,7 @@ export const useConvoStore = create<ConvoState>((set, get) => ({
         index,
         minutes: route.minutes,
         selected: index === trip.selectedIndex,
+        label: route.label,
       }))
       const result = await replyConversation(tripId, text, routeOptions)
       set((s) => ({

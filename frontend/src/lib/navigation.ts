@@ -16,6 +16,7 @@
 // /gps-update, the live puck, arrival — is identical in both modes, which is
 // exactly what makes sim an honest stand-in during development.
 import { streamGpsPoints } from './api'
+import { lengthFractions } from './routeProgress'
 
 const TICK_MS = 800 // sim: emit a position this often
 const FLUSH_MS = 3000 // send buffered points to the backend this often
@@ -33,7 +34,12 @@ export interface DrivePosition {
 
 interface DriveHandlers {
   onPosition: (p: DrivePosition) => void
-  onProgress: (fraction: number) => void // 0..1 along the route
+  /** 0..1 of the route's LENGTH driven so far — not of its coordinate count.
+   * Consumers treat it as a distance: the map greys the traveled span with it
+   * (`line-progress`), TripSheet multiplies it by total miles to pick the
+   * current maneuver, NavVoice speaks the remainder. Index-based progress
+   * silently lied to all three on any route with uneven point spacing. */
+  onProgress: (fraction: number) => void
   onArrive: () => void
   /** Real mode only: watchPosition failed (permission denied, no signal).
    * The drive cannot continue — callers should stop navigation and say why. */
@@ -72,6 +78,9 @@ function distSqMeters(a: [number, number], b: [number, number]): number {
 export class DriveController {
   private readonly tripId: string
   private readonly coords: [number, number][] // [lng, lat] along the route
+  /** Cumulative length fraction at each coordinate — index-parallel to
+   * `coords`, so a nearest-point index converts to distance progress in O(1). */
+  private readonly fractions: number[]
   private readonly handlers: DriveHandlers
   private readonly mode: DriveMode
   private readonly geo: GeolocationLike | null
@@ -95,6 +104,7 @@ export class DriveController {
   ) {
     this.tripId = tripId
     this.coords = coords
+    this.fractions = lengthFractions(coords)
     this.handlers = handlers
     this.mode = mode
     this.geo = geo
@@ -150,7 +160,7 @@ export class DriveController {
       }
     }
     this.idx = nearest
-    const progress = nearest / (this.coords.length - 1)
+    const progress = this.fractions[nearest]
     this.handlers.onProgress(progress)
 
     // Arrived: near the final coordinate AND genuinely in the route's tail —
@@ -169,7 +179,7 @@ export class DriveController {
     this.idx = Math.min(this.idx + this.stride, this.coords.length - 1)
     const [lng, lat] = this.coords[this.idx]
     this.handlers.onPosition({ lng, lat })
-    this.handlers.onProgress(this.idx / (this.coords.length - 1))
+    this.handlers.onProgress(this.fractions[this.idx])
     this.buffer.push({ lat, lon: lng, timestamp: new Date().toISOString() })
     if (this.idx >= this.coords.length - 1) this.arrive()
   }

@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import Trip, UserPreference
 from db.session import get_db
+from routing.candidate_generator import generate_candidates
 from routing.route_ranker import RouteRanker
 from routing.valhalla_client import UserRoutingPrefs, ValhallaRouter
 
@@ -45,10 +46,27 @@ class RouteRequest(BaseModel):
 
 class RouteResponse(BaseModel):
     trip_id: str
-    routes: list[dict]                    # Primary route first, then alternates
+    routes: list[dict]                    # Distinct candidates, recommended one indexed below
     recommended_index: int                # Which one we suggest (RL picks this later)
     estimated_minutes: float
     context_summary: str
+    # Plain-language name for each candidate ("Fewest turns", "No highways"),
+    # parallel to `routes`. Note these are NOT unique: every Valhalla alternate
+    # is labelled "Another way", so clients must key on index, not label.
+    route_labels: list[str] = Field(default_factory=list)
+    # Machine key for each candidate ("avoid_highways", "fewest_turns"), also
+    # parallel to `routes`. Same values already recorded in
+    # trips.context["route_strategies"]. The frontend picks its per-route
+    # "why" line off this rather than string-matching route_labels, which are
+    # display copy and expected to get reworded.
+    route_strategies: list[str] = Field(default_factory=list)
+    # Whether each candidate is the route its strategy actually optimised for,
+    # parallel to `routes`. False means it is one of the alternates Valhalla
+    # returned alongside that strategy's own route — useful variety, but not
+    # what the strategy asked for, so its label carries no information (they are
+    # all "Another way"). The frontend keys off this to decide whether to show
+    # the strategy's name or to name the route by the road it mostly runs on.
+    route_primary: list[bool] = Field(default_factory=list)
 
 
 def _get_router(request: Request) -> ValhallaRouter:
@@ -96,12 +114,17 @@ async def get_route(
     prefs = await _load_prefs(db, request.user_id, request.declared_intent)
 
     try:
-        data = await router_client.get_route(
+        # A sweep of deliberately different costing strategies, not one call.
+        # Valhalla's own alternates are near-duplicates (measured: 13.14, 13.16
+        # and 19.44 mi for one pair), which left the ranker nothing real to
+        # choose between — see routing/candidate_generator.py.
+        candidates = await generate_candidates(
+            router_client,
             origin=(request.origin_lat, request.origin_lon),
             destination=(request.dest_lat, request.dest_lon),
-            waypoints=[(wp["lat"], wp["lon"]) for wp in request.waypoints] or None,
             prefs=prefs,
-            costing=request.mode,
+            mode=request.mode,
+            waypoints=[(wp["lat"], wp["lon"]) for wp in request.waypoints] or None,
         )
     except httpx.HTTPStatusError as exc:
         # Valhalla returns 400 with a JSON error for unroutable points (e.g.
@@ -111,7 +134,7 @@ async def get_route(
     except httpx.HTTPError:
         raise HTTPException(status_code=503, detail="routing engine unreachable")
 
-    routes = [data["trip"]] + [alt["trip"] for alt in data.get("alternates", [])]
+    routes = [c.trip for c in candidates]
 
     # Which candidate to recommend. With no trained scorer this returns 0
     # (Valhalla's own primary), so the endpoint behaves exactly as before until
@@ -120,11 +143,26 @@ async def get_route(
     route_context = {"declared_intent": request.declared_intent, "mode": request.mode}
     ranked = ranker.rank(routes, prefs, route_context)
 
+    # Store the response with the RECOMMENDED route as `trip`, not whichever
+    # candidate happened to come back first. Everything downstream that scores
+    # the trip — compute_implicit_signals via route_coords_from_suggested, and
+    # the scorer's training features — reads `suggested_route["trip"]`, so if
+    # that isn't the route the user was actually shown, adherence gets measured
+    # against a route they never saw. Harmless while the ranker always returned
+    # 0; a real bug the moment it starts choosing.
+    recommended_trip = routes[ranked.recommended_index]
+    stored_route = {
+        "trip": recommended_trip,
+        "alternates": [
+            {"trip": t} for i, t in enumerate(routes) if i != ranked.recommended_index
+        ],
+    }
+
     trip = Trip(
         user_id=uuid.UUID(request.user_id) if request.user_id else None,
         origin=WKTElement(f"POINT({request.origin_lon} {request.origin_lat})", srid=4326),
         destination=WKTElement(f"POINT({request.dest_lon} {request.dest_lat})", srid=4326),
-        suggested_route=data,
+        suggested_route=stored_route,
         context={
             "declared_intent": request.declared_intent,
             "origin_label": request.origin_label,
@@ -137,6 +175,11 @@ async def get_route(
             "recommended_index": ranked.recommended_index,
             "route_scores": ranked.scores,
             "personalization_active": ranked.personalization_active,
+            # Which strategy produced each candidate, and which one won. This is
+            # the label the scorer can eventually learn on ("this user keeps
+            # picking fewest_turns").
+            "route_strategies": [c.strategy for c in candidates],
+            "recommended_strategy": candidates[ranked.recommended_index].strategy,
         },
     )
     db.add(trip)
@@ -146,6 +189,9 @@ async def get_route(
     return RouteResponse(
         trip_id=str(trip.id),
         routes=routes,
+        route_labels=[c.label for c in candidates],
+        route_strategies=[c.strategy for c in candidates],
+        route_primary=[c.is_primary for c in candidates],
         recommended_index=ranked.recommended_index,
         estimated_minutes=recommended["summary"]["time"] / 60,
         context_summary="Route calculated based on your preferences.",

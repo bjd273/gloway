@@ -146,6 +146,28 @@ async def test_trained_ranker_changes_the_recommendation(client):
         assert data["estimated_minutes"] == pytest.approx(
             data["routes"][slowest]["summary"]["time"] / 60
         )
+
+        # The stored trip must describe the route the user was actually shown.
+        # Everything that scores the trip later — compute_implicit_signals via
+        # route_coords_from_suggested, and the scorer's own training features —
+        # reads suggested_route["trip"], so storing Valhalla's primary while
+        # recommending a different candidate would measure adherence against a
+        # route the driver never saw.
+        from db.session import get_session_factory
+
+        async with get_session_factory()() as session:
+            stored = (
+                await session.execute(
+                    text("SELECT suggested_route, context FROM trips WHERE id = :id"),
+                    {"id": data["trip_id"]},
+                )
+            ).one()
+        suggested, context = stored
+        assert suggested["trip"]["summary"]["time"] == pytest.approx(
+            data["routes"][slowest]["summary"]["time"]
+        )
+        assert len(suggested["alternates"]) == len(data["routes"]) - 1
+        assert context["recommended_strategy"] == context["route_strategies"][slowest]
     finally:
         app.state.route_ranker = previous
         from db.session import get_session_factory

@@ -32,3 +32,6 @@ backend/mlruns/
 backend/mlruns.db
 backend/mlartifacts/
 tensorboard_logs/
+
+# Local design-review tool state
+.impeccable/

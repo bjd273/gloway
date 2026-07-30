@@ -1,14 +1,15 @@
-// The area Gloway can currently route: the Central Arlington, TX extract that
+// The area Gloway can currently route: the Arlington, TX extract that
 // Valhalla's tiles and Martin's basemap were built from (data/download_osm.sh).
-// Grows as bigger OSM extracts are built — this file is the single place the
-// frontend knows about coverage.
+// This file is the single place the *frontend* knows about coverage, and the
+// numbers themselves come from region.json — a copy of the canonical
+// data/region.json that scripts/rebuild_region.sh keeps in sync. They live in
+// JSON so the shell scripts, the RL trainer and this file all read one bbox
+// rather than four hand-maintained copies that can silently disagree with the
+// tiles actually built. Do not edit region.json here; edit data/region.json and
+// re-run scripts/rebuild_region.sh.
+import regionData from './region.json'
 
-export const REGION_BBOX = {
-  west: -97.14,
-  south: 32.715,
-  east: -97.08,
-  north: 32.76,
-}
+export const REGION_BBOX = regionData.bbox
 
 // Padded so users can breathe at the edges without ever reaching blank tiles.
 const PAD = 0.06
@@ -32,4 +33,4 @@ export function inRegion(lat: number, lon: number): boolean {
 }
 
 export const OUT_OF_AREA_MESSAGE =
-  'Gloway is just getting started — right now it knows central Arlington, TX.'
+  'Gloway is just getting started — right now it knows Arlington, TX.'

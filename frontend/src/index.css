@@ -6,6 +6,12 @@
   --glow-a: #3ee7ed;   /* bright cyan — gradient start + bright solo elements */
   --glow-b: #05767a;   /* darkest teal — gradient end */
   --glow-gradient: linear-gradient(135deg, var(--glow-a), var(--glow-b));
+  /* The same gradient, pulled down into the range that carries white text at
+     WCAG AA. --glow-a is 1.5:1 against white — unreadable on the one button
+     that matters most. The bright cyan comes back as a rim highlight on
+     .gw-primary, so the button still reads as lit rather than merely dark.
+     The map ribbon keeps the full-range --glow-gradient: no text sits on it. */
+  --glow-gradient-legible: linear-gradient(135deg, #067f84, #04565a);
   --accent: #02a4aa;   /* mid teal — legible solo-use accent (icons/markers) in both themes */
   --lime: #c0ff71;     /* pop accent, used sparingly */
 
@@ -68,10 +74,8 @@ body {
 
 /* --- glass surface primitive --- */
 .wordmark,
-.prompt-bar,
-.prompt-responses,
-.prompt-from,
-.trip-panel,
+.sheet,
+.gw-bubble-body,
 .prefs-button,
 .prefs-panel {
   background: var(--surface);
@@ -103,49 +107,6 @@ body {
   letter-spacing: -0.01em;
 }
 
-/* --- prompt bar --- */
-.prompt-shell {
-  position: absolute;
-  /* Clears the notch / status bar — see the viewport-fit note in index.html. */
-  top: max(14px, env(safe-area-inset-top));
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 30;
-  width: min(440px, calc(100vw - 24px));
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.prompt-bar {
-  display: flex;
-  align-items: center;
-  padding: 4px 14px;
-  border-radius: 999px;
-  transition: box-shadow 0.2s ease;
-}
-
-.prompt-bar:focus-within {
-  box-shadow:
-    var(--shadow),
-    0 0 0 2px color-mix(in srgb, var(--glow-a) 55%, var(--glow-b) 45%);
-}
-
-.prompt-bar input {
-  flex: 1;
-  border: none;
-  outline: none;
-  background: transparent;
-  color: var(--text);
-  font: inherit;
-  font-size: 16px;
-  padding: 10px 2px;
-}
-
-.prompt-bar input::placeholder {
-  color: var(--text-muted);
-}
-
 .prompt-spinner {
   width: 14px;
   height: 14px;
@@ -159,11 +120,6 @@ body {
   to {
     transform: rotate(360deg);
   }
-}
-
-.prompt-bar--set {
-  justify-content: space-between;
-  padding: 12px 14px;
 }
 
 .prompt-dest {
@@ -180,7 +136,7 @@ body {
   width: 10px;
   height: 10px;
   border-radius: 50%;
-  background: var(--glow-gradient);
+  background: var(--accent);
   box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 60%, transparent);
 }
 
@@ -197,14 +153,6 @@ body {
 .prompt-clear:hover {
   color: var(--text);
   background: var(--border);
-}
-
-.prompt-from {
-  align-self: center;
-  padding: 6px 14px;
-  border-radius: 999px;
-  font-size: 12.5px;
-  color: var(--text-muted);
 }
 
 /* --- saved-place shortcuts (Home / Work) --- */
@@ -323,38 +271,206 @@ body {
   border-top: 1px solid var(--border);
 }
 
-/* --- trip panel --- */
-.trip-panel {
+/* --- the bottom sheet ---
+   One surface, three heights. Replaces the old top prompt shell + bottom trip
+   panel, which sandwiched the map into a sliver exactly when the map was the
+   thing worth looking at. */
+.sheet {
   position: absolute;
   z-index: 25;
-  left: 12px;
-  right: 12px;
-  /* Clear the home indicator. At 12px the action row ("Start drive") lands
-     under it on a notched iPhone and cannot be tapped — which matters most
-     in exactly the situation the app is for, a phone in a car mount. */
-  bottom: max(12px, env(safe-area-inset-bottom));
+  left: 0;
+  right: 0;
+  bottom: 0;
   /* dvh, not vh: mobile browser chrome shows and hides while driving, and vh
      is frozen at the largest viewport, so the panel got clipped as the bar
      came back. */
-  max-height: 42dvh;
-  padding: 16px;
+  height: var(--sheet-h, 50dvh);
+  border-radius: 14px 14px 0 0;
+  /* Clear the home indicator. At a flat 12px the action row ("Start drive")
+     lands under it on a notched iPhone and cannot be tapped — which matters
+     most in exactly the situation the app is for, a phone in a car mount. */
+  padding: 0 14px max(12px, env(safe-area-inset-bottom));
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
   overflow: hidden;
-  /* Scrolling the step list shouldn't rubber-band the whole page over a
+  /* Scrolling inside the sheet shouldn't rubber-band the whole page over a
      moving map. */
   overscroll-behavior: contain;
+  touch-action: none;
+  /* Height, not transform, and deliberately so: the action row has to stay
+     visible at every snap, so the sheet genuinely resizes rather than sliding
+     a taller surface off the bottom — translateY would carry the primary
+     button off-screen at peek, which is the one thing peek must not do.
+     Two things keep the layout cost bounded: `contain` stops the resize
+     invalidating anything outside the sheet, and a drag sets height directly
+     with [data-dragging] switching the transition off, so this only animates
+     on a discrete snap. */
+  contain: layout paint;
+  transition: height 0.28s cubic-bezier(0.32, 0.72, 0, 1);
 }
 
+/* Fixed heights rather than auto: `auto` doesn't animate in Safari without
+   interpolate-size, and this transition runs on every snap. */
+.sheet[data-snap='peek'] {
+  --sheet-h: 26dvh;
+}
+
+.sheet[data-snap='half'] {
+  --sheet-h: 50dvh;
+}
+
+.sheet[data-snap='full'] {
+  --sheet-h: 88dvh;
+}
+
+/* The height is being written directly by the drag handler; don't ease it. */
+.sheet[data-dragging] {
+  transition: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sheet {
+    transition: none;
+  }
+}
+
+/* Peek shows header + summary + actions only. The scroll region stays mounted
+   and simply clips — unmounting the step list on every drag would be jank, and
+   NavVoice's socket lives below it.
+
+   This used to also set `pointer-events: none`, so a drag starting over the
+   clipped list would move the sheet instead of scrolling the list. It did that,
+   and it also killed every tap on the controls still visible in the sliver —
+   route cards and the travel-mode toggle looked live and did nothing, and the
+   only way through was to hit "N ways" first. `touch-action: none` buys the
+   original behaviour honestly: it overrides the base `pan-y` so the browser
+   hands the gesture to the sheet's drag handler rather than trying to pan a box
+   that `overflow: hidden` has already made unscrollable, and a tap is still a
+   tap. Sheet.tsx's onPointerDown bails on anything inside a button, so a press
+   on a card never starts a drag either. */
+.sheet[data-snap='peek'] .sheet-scroll {
+  overflow: hidden;
+  touch-action: none;
+}
+
+.sheet:not([data-snap='full']) .trip-steps {
+  display: none;
+}
+
+/* Desktop: back to a fixed card in the corner. No snapping, no dragging — a
+   mouse has no thumb-reach problem to solve. */
 @media (min-width: 768px) {
-  .trip-panel {
+  .sheet {
     left: 14px;
     right: auto;
     bottom: 14px;
-    width: 330px;
-    max-height: min(60dvh, 560px);
+    width: 360px;
+    height: auto;
+    max-height: min(72dvh, 640px);
+    border-radius: 14px;
+    padding: 0 16px 16px;
+    touch-action: auto;
   }
+
+  .sheet .sheet-scroll,
+  .sheet:not([data-snap='full']) .trip-steps {
+    display: flex;
+    overflow-y: auto;
+    pointer-events: auto;
+  }
+
+  /* Scoped to .sheet so it outranks the base .sheet-grabber rule below, which
+     appears later in the file. No snapping on desktop, so nothing to grab. */
+  .sheet > .sheet-grabber {
+    display: none;
+  }
+}
+
+/* --- sheet furniture --- */
+.sheet-grabber {
+  flex: none;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Thumb-sized: this is the control that resizes the panel one-handed. */
+  min-height: 30px;
+  padding: 12px 0 6px;
+  border: none;
+  background: transparent;
+  cursor: grab;
+}
+
+.sheet-grabber:active {
+  cursor: grabbing;
+}
+
+.sheet-grabber-bar {
+  width: 36px;
+  height: 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--text) 22%, transparent);
+}
+
+.sheet-grabber:focus-visible {
+  outline: none;
+}
+
+.sheet-grabber:focus-visible .sheet-grabber-bar {
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+/* Preferences is also a bottom sheet; while it's up, the one underneath gets
+   out of the way rather than stacking. */
+body[data-prefs-open] .sheet,
+body[data-prefs-open] .gw-bubble {
+  opacity: 0.35;
+  pointer-events: none;
+}
+
+.sheet-header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.sheet-search {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+}
+
+.sheet-from {
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+/* The only scrolling region. flex:1 + min-height:0 is what lets it absorb the
+   sheet's height instead of pushing the actions off the bottom. */
+.sheet-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  scrollbar-width: thin;
+}
+
+/* Always visible, at every snap — a reachable primary action is the whole
+   point of peek. */
+.sheet-actions {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
 .trip-error {
@@ -372,19 +488,40 @@ body {
 }
 
 .trip-summary {
+  flex: none;
   display: flex;
   align-items: baseline;
   gap: 10px;
 }
 
+/* "6 ways" — raises the sheet to compare, so peek can stay minimal without
+   hiding that there is a choice. */
+.trip-summary-more {
+  margin-left: auto;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  padding: 6px 12px;
+  min-height: 34px;
+  cursor: pointer;
+}
+
+.trip-summary-more:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/* Plain text, not gradient-clipped: a duration is information, not an action.
+   Its 26px/600 is already the largest thing in the panel — that's the emphasis. */
 .trip-time {
   font-size: 26px;
   font-weight: 600;
   letter-spacing: -0.02em;
-  background: var(--glow-gradient);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
+  color: var(--text);
 }
 
 .trip-distance {
@@ -447,6 +584,143 @@ body {
   flex-wrap: wrap;
 }
 
+/* --- route cards --- */
+.route-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.route-card {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  width: 100%;
+  min-height: 56px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.route-card:hover {
+  background: color-mix(in srgb, var(--text) 4%, transparent);
+}
+
+.route-card:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.route-card--selected {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+/* A legend key, not a decorative rail: this is a piece of the route's own line,
+   drawn in the colour that line is currently painted on the map. --route-line
+   is set inline from ROUTE_COLORS so the two can't drift. */
+.route-card-swatch {
+  flex: none;
+  width: 18px;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--route-line, var(--text-muted));
+}
+
+/* Selected reads through weight, not a second gradient — the inline
+   --route-line is already this route's line colour. */
+.route-card--selected .route-card-swatch {
+  height: 4px;
+}
+
+.route-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.route-card-title {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.route-card-label {
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.route-card--selected .route-card-label {
+  font-weight: 600;
+}
+
+.route-card-time {
+  font-size: 14px;
+  color: var(--text-muted);
+}
+
+/* The decision-relevant number. Tabular so a column of deltas lines up. */
+.route-card-delta {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.route-card-reason {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.route-card-tag {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.route-more {
+  align-self: flex-start;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 8px 2px;
+  min-height: 44px;
+  cursor: pointer;
+}
+
+.route-more:hover {
+  color: var(--text);
+}
+
+/* Visually hidden, still announced — the delta reads as a bare "+11" otherwise. */
+.gw-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 .trip-chip {
   border: 1px solid var(--border);
   background: transparent;
@@ -459,16 +733,22 @@ body {
   cursor: pointer;
 }
 
+/* Selection reads as a solid accent outline, not a gradient fill — the
+   gradient belongs to the one primary action per screen (.gw-primary).
+   The label stays --text: accent-on-light-panel is only 2.8:1, under AA. The
+   border and wash carry "selected"; the text only has to stay readable. */
 .trip-chip--active {
-  border-color: transparent;
-  background: var(--glow-gradient);
-  color: #fff;
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  color: var(--text);
+  font-weight: 600;
 }
 
+/* The sheet's own scroll region handles overflow now; the step list just
+   flows inside it. */
 .trip-steps {
-  min-height: 0;
-  overflow-y: auto;
-  scrollbar-width: thin;
+  display: flex;
+  flex-direction: column;
 }
 
 .trip-steps ol {
@@ -582,10 +862,12 @@ body {
   border-color: color-mix(in srgb, var(--glow-a) 55%, var(--glow-b) 45%);
 }
 
+/* --glow-b, not --accent: white on --accent is 3.05:1 and white on --glow-b is
+   5.41:1. Any accent surface carrying white text uses the deep end. */
 .prefs-save {
   border: none;
   border-radius: 999px;
-  background: var(--glow-gradient);
+  background: var(--glow-b);
   color: #fff;
   font: inherit;
   font-size: 13.5px;
@@ -636,7 +918,7 @@ body {
 }
 
 .pref-row input:checked {
-  background: var(--glow-gradient);
+  background: var(--accent);
 }
 
 .pref-row input:checked::after {
@@ -656,7 +938,74 @@ body {
   color: #ff6b6b;
 }
 
-/* --- pre-journey conversation (inside the prompt shell) --- */
+/* --- the assistant's reply, over the map, briefly ---
+   Rides directly above the sheet at whatever height it currently is. The sheet
+   is the only writer of --gw-sheet-h (published from a ResizeObserver), so this
+   tracks a drag in progress without any JS here. */
+.gw-bubble {
+  position: absolute;
+  z-index: 28;
+  bottom: calc(var(--gw-sheet-h, 26dvh) + 12px);
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(440px, calc(100vw - 24px));
+  display: flex;
+  justify-content: flex-start;
+  pointer-events: none;
+  opacity: 1;
+  transition:
+    opacity 0.35s ease,
+    transform 0.35s ease;
+}
+
+.gw-bubble--leaving {
+  opacity: 0;
+  transform: translateX(-50%) translateY(4px);
+}
+
+.gw-bubble-body {
+  pointer-events: auto;
+  max-width: 85%;
+  /* Same asymmetric tail as the conversation bubbles it replaces. */
+  border-radius: 14px;
+  border-bottom-left-radius: 4px;
+  padding: 10px 14px;
+  color: var(--text);
+  font: inherit;
+  font-size: 13.5px;
+  line-height: 1.45;
+  text-align: left;
+  cursor: pointer;
+}
+
+.gw-bubble-thinking {
+  letter-spacing: 2px;
+  color: var(--text-muted);
+  animation: convo-pulse 1.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gw-bubble {
+    transition: opacity 0.35s ease;
+  }
+
+  .gw-bubble--leaving {
+    transform: translateX(-50%);
+  }
+
+  .gw-bubble-thinking {
+    animation: none;
+  }
+}
+
+/* --- chat, reduced to one bar in the sheet footer --- */
+.chat-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* --- post-trip debrief conversation --- */
 .convo {
   display: flex;
   flex-direction: column;
@@ -687,13 +1036,15 @@ body {
   line-height: 1.45;
 }
 
+/* The user's own words are the quietest thing in the conversation — they're a
+   record of what was said, not something to draw the eye back to. */
 .convo-bubble--user {
   align-self: flex-end;
   border-radius: 14px;
   border-bottom-right-radius: 4px;
-  background: var(--glow-gradient);
-  border: none;
-  color: #fff;
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  border: 1px solid var(--border);
+  color: var(--text);
 }
 
 .convo-bubble--thinking {
@@ -834,6 +1185,71 @@ body {
   padding: 4px 7px;
 }
 
+.place-action:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* --- editing a saved place --- */
+.place-edit {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--text) 3%, transparent);
+}
+
+/* Inside an already-glass panel, so a flat field rather than a second pane —
+   glass over glass just reads as mud. */
+.place-search-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-solid);
+  padding: 0 14px;
+}
+
+.place-search-bar:focus-within {
+  border-color: color-mix(in srgb, var(--glow-a) 55%, var(--glow-b) 45%);
+}
+
+.place-search-bar input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  /* 16px floor: anything smaller and iOS Safari zooms the viewport on focus. */
+  font-size: 16px;
+  padding: 10px 0;
+}
+
+.place-search-bar input::placeholder {
+  color: var(--text-muted);
+}
+
+.place-results {
+  display: flex;
+  flex-direction: column;
+  max-height: 210px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.place-edit-actions {
+  display: flex;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
 /* --- navigation controls --- */
 .trip-drivemode {
   display: flex;
@@ -853,17 +1269,43 @@ body {
   gap: 10px;
 }
 
-.trip-start {
-  flex: 1;
+/* --- the one gradient ---
+   The single primary action on screen. TripPanel's action block is a three-way
+   switch (wrap-up / navigating / pre-drive) and only ever renders one of these
+   at a time, so "one gradient per screen" holds even though three selectors
+   carry the class. Taken literally, keeping it on .trip-start alone would leave
+   the navigating and wrap-up screens with no primary action at all. */
+.gw-primary {
   border: none;
   border-radius: 999px;
-  background: var(--glow-gradient);
+  background: var(--glow-gradient-legible);
   color: #fff;
   font: inherit;
-  font-size: 14px;
   font-weight: 600;
-  padding: 11px 16px;
   cursor: pointer;
+  /* The light, kept: a bright cyan rim along the top edge instead of across
+     the face, so nothing sits between the text and its background. */
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--glow-a) 70%, transparent),
+    0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+.gw-primary:focus-visible {
+  outline: none;
+  box-shadow:
+    inset 0 1px 0 color-mix(in srgb, var(--glow-a) 70%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--glow-a) 50%, transparent);
+}
+
+.gw-primary:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.trip-start {
+  flex: 1;
+  font-size: 14px;
+  padding: 11px 16px;
 }
 
 .trip-nav {
@@ -880,15 +1322,33 @@ body {
   overflow: hidden;
 }
 
+/* scaleX, not width: this is the one animation that runs continuously for the
+   whole drive (it re-targets on every GPS tick), so it stays off the layout
+   path entirely. transform-origin pins the growth to the left edge. */
 .trip-nav-progress-fill {
+  width: 100%;
   height: 100%;
   border-radius: 999px;
-  background: var(--glow-gradient);
-  transition: width 0.7s linear;
+  background: var(--accent);
+  transform-origin: left center;
+  transition: transform 0.7s linear;
+  will-change: transform;
 }
 
+/* Tapped mid-drive, so it carries the 44px floor rather than the chip's 13px
+   padding it used to inherit. */
 .trip-nav-arrive {
   flex: none;
+  font-size: 13.5px;
+  padding: 9px 18px;
+  min-height: 44px;
+}
+
+.debrief-done {
+  align-self: flex-start;
+  font-size: 13.5px;
+  padding: 9px 18px;
+  min-height: 44px;
 }
 
 /* --- in-drive voice (push-to-talk) --- */
@@ -899,13 +1359,16 @@ body {
   margin-top: 10px;
 }
 
+/* Solid deep teal, not the gradient: nav-voice-pulse already carries "live",
+   the gradient belongs to the primary action, and the deep end is the accent
+   value that carries a white glyph at AA. */
 .nav-voice-mic {
   flex: none;
   width: 44px;
   height: 44px;
   border: none;
   border-radius: 999px;
-  background: var(--glow-gradient);
+  background: var(--glow-b);
   color: #fff;
   font-size: 18px;
   line-height: 1;
@@ -1010,6 +1473,13 @@ body {
   border-color: color-mix(in srgb, var(--glow-a) 55%, var(--glow-b) 45%);
 }
 
+.trip-wrapup-send {
+  flex: none;
+  font-size: 13.5px;
+  padding: 9px 18px;
+  min-height: 44px;
+}
+
 .trip-wrapup-error {
   flex-basis: 100%;
 }
@@ -1044,6 +1514,7 @@ body {
 
 /* --- live navigation puck --- */
 .gw-puck {
+  position: absolute; /* containing block for the heading arrow below */
   width: 18px;
   height: 18px;
   border-radius: 50%;
@@ -1054,11 +1525,176 @@ body {
     0 0 0 6px color-mix(in srgb, var(--lime) 45%, transparent);
 }
 
+/* Direction of travel. The marker is rotated by MapLibre (rotationAlignment
+   'map'), so this only ever has to point "up" — the arrow sits ahead of the
+   dot rather than on it, which keeps the dot readable as the position and the
+   arrow readable as the heading. Hidden until a bearing is actually known:
+   see MapView's .gw-puck-heading toggle. */
+.gw-puck-arrow {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 3px);
+  width: 0;
+  height: 0;
+  opacity: 0;
+  transform: translateX(-50%);
+  border-left: 6px solid transparent;
+  border-right: 6px solid transparent;
+  border-bottom: 9px solid #fff;
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.4));
+  transition: opacity 0.2s ease;
+}
+
+.gw-puck-heading .gw-puck-arrow {
+  opacity: 1;
+}
+
+/* --- re-centre control (driving only) --- */
+/* Appears only after the driver has panned the map away from themselves, and
+   disappears the moment they take the camera back — a control that is always
+   there is a control that is always in the way. Top-centre is the one edge of
+   the screen not already spoken for (wordmark left, gear right, sheet and
+   assistant bubble bottom). */
+.map-recenter {
+  position: absolute;
+  z-index: 24;
+  top: max(14px, env(safe-area-inset-top));
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 14px 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  box-shadow: var(--shadow);
+  color: var(--text);
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  animation: recenter-in 0.22s ease;
+}
+
+.map-recenter svg {
+  color: var(--accent);
+}
+
+@keyframes recenter-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -6px);
+  }
+}
+
+/* The transient failure notice borrows the pill's shell — same slot, same
+   glass — but is text, not a control, so it drops the pointer affordances. */
+.map-notice {
+  max-width: min(320px, calc(100vw - 28px));
+  padding: 9px 14px;
+  font-weight: 500;
+  text-align: center;
+  cursor: default;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .map-recenter {
+    animation: none;
+  }
+}
+
 /* --- maplibre chrome, themed --- */
-.maplibregl-ctrl-group {
+/* Everything here is scoped under .map-container on purpose. maplibre-gl.css
+   is imported from MapView and therefore loads AFTER this file (the same
+   ordering the .map-container rule at the top of this file already works
+   around), so an equal-specificity selector silently loses to MapLibre's own.
+   The extra class outranks it instead of relying on order. */
+.map-container .maplibregl-ctrl-group {
   background: var(--surface-solid);
   border-radius: 10px;
   overflow: hidden;
+}
+
+/* MapLibre's default is 29px, which is a poor target for the phone-in-a-car-
+   mount case this whole app is built around — the same concern the sheet's
+   safe-area padding already answers for "Start drive". The icons are
+   background-positioned at 50%, so they stay centred as the button grows. */
+.map-container .maplibregl-ctrl-group button {
+  width: 38px;
+  height: 38px;
+}
+
+/* The locate button rides in this corner as its own control group, sitting
+   above the zoom stack (MapLibre inserts bottom-corner controls at the front,
+   so "added last" means "drawn on top"). These rules close the 10px gap
+   between the two groups and square the corners where they meet, so the whole
+   thing reads as one toolbar rather than two stacked widgets. */
+.map-container .gw-ctrl-locate.maplibregl-ctrl {
+  margin-bottom: 0;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.map-container .gw-ctrl-locate + .maplibregl-ctrl-group {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+.gw-locate-button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: none;
+  /* The seam matching the divider MapLibre draws between zoom-in and zoom-out. */
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.gw-locate-button:hover {
+  background: color-mix(in srgb, var(--text) 5%, transparent);
+}
+
+/* A cold GPS fix can take seconds. Pulsing the icon says "asking" without a
+   spinner competing with the crosshair's own meaning. */
+.gw-locate-button--busy {
+  animation: locate-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes locate-pulse {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* The corner sits at bottom: 0, which on a phone is underneath the sheet —
+   every control here (zoom, compass, attribution) has been unreachable there.
+   Ride the sheet instead, on its own snap easing so the toolbar moves with the
+   panel rather than chasing it. Desktop keeps MapLibre's default: the sheet is
+   a left-hand rail there and this corner is already clear. */
+@media (max-width: 767px) {
+  .map-container .maplibregl-ctrl-bottom-right {
+    bottom: calc(var(--gw-sheet-h, 26dvh) + 4px);
+    transition: bottom 0.28s cubic-bezier(0.32, 0.72, 0, 1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gw-locate-button--busy {
+    animation: none;
+  }
+
+  .map-container .maplibregl-ctrl-bottom-right {
+    transition: none;
+  }
 }
 
 @media (prefers-color-scheme: dark) {

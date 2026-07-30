@@ -134,7 +134,13 @@ async def test_full_journey_teaches_the_next_route(client):
     real_get_route = app.state.valhalla_router.get_route
 
     async def spy_get_route(*args, **kwargs):
-        used_prefs.append(kwargs.get("prefs"))
+        # One /route request now fans out into several Valhalla calls (the
+        # candidate-generation sweep), all sharing one prefs object. Record per
+        # *request* by collapsing consecutive calls that carry the same object,
+        # so the indices below stay "first trip" and "second trip".
+        prefs = kwargs.get("prefs")
+        if not used_prefs or used_prefs[-1] is not prefs:
+            used_prefs.append(prefs)
         return await real_get_route(*args, **kwargs)
 
     app.state.valhalla_router.get_route = spy_get_route

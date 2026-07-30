@@ -1,9 +1,10 @@
 import { useEffect } from 'react'
 
+import { AssistantBubble } from './components/AssistantBubble'
 import { MapView } from './components/MapView'
 import { PrefsPanel } from './components/PrefsPanel'
-import { PromptBar } from './components/PromptBar'
-import { TripPanel } from './components/TripPanel'
+import { Sheet } from './components/Sheet'
+import { TripSheet } from './components/TripSheet'
 import { Wordmark } from './components/Wordmark'
 import { useUserStore } from './stores/useUserStore'
 
@@ -14,13 +15,19 @@ function App() {
     if (useUserStore.getState().userId) void useUserStore.getState().loadProfile()
   }, [])
 
+  // Everything floats over a full-bleed map. Stacking order, low to high:
+  // map (0) → wordmark (20) → sheet (25) → assistant bubble (28) → prefs (30).
+  // The bubble is a sibling of the sheet, not a child: inside it, the sheet's
+  // overflow would clip it and the sheet's scrolling would drag it around.
   return (
     <>
       <MapView />
       <Wordmark />
-      <PromptBar />
       <PrefsPanel />
-      <TripPanel />
+      <AssistantBubble />
+      <Sheet>
+        <TripSheet />
+      </Sheet>
     </>
   )
 }

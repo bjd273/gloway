@@ -8,8 +8,8 @@
 import { create } from 'zustand'
 
 import { FriendlyError, getRoute, type ParsedRoute, type TravelMode } from '../lib/api'
+import { resolveOrigin } from '../lib/geolocate'
 import { DriveController, type DriveMode, resolveDriveMode } from '../lib/navigation'
-import { inRegion } from '../lib/region'
 import { useUserStore } from './useUserStore'
 
 // The active drive's streaming controller. Non-serializable, so it lives
@@ -56,6 +56,13 @@ interface TripState {
   stops: Place[]
   routes: ParsedRoute[]
   selectedIndex: number
+  /** Which route the backend recommended. Kept separate from selectedIndex so
+   * the per-route time delta always reads against a fixed baseline — using the
+   * selection instead would reshuffle every number on every tap. */
+  recommendedIndex: number
+  /** Route the user is previewing (pointer/focus on its card), highlighted on
+   * the map without committing the selection. Null when nothing is hovered. */
+  hoveredRouteIndex: number | null
   tripId: string | null
   status: TripStatus
   errorMessage: string | null
@@ -83,6 +90,8 @@ interface TripState {
   setOrigin(p: Place): void
   moveEndpoint(which: 'origin' | 'destination', p: Place): void
   selectRoute(index: number): void
+  /** Preview a route without committing to it. Pass null to clear. */
+  hoverRoute(index: number | null): void
   /** Re-request the current trip (e.g. after a preference change). No-op
    * unless both endpoints are set. */
   refreshRoute(): void
@@ -108,31 +117,6 @@ interface TripState {
   clearTrip(): void
 }
 
-/** Resolve a starting point: user's location if allowed *and* inside the
- * routable region, else the current map center. Never nags for permission —
- * a denied/slow geolocation silently falls back. */
-function resolveOrigin(mapCenter: Place): Promise<Place> {
-  return new Promise((resolve) => {
-    if (!navigator.geolocation) return resolve(mapCenter)
-    const fallback = setTimeout(() => resolve(mapCenter), 3000)
-    navigator.geolocation.getCurrentPosition(
-      ({ coords }) => {
-        clearTimeout(fallback)
-        if (inRegion(coords.latitude, coords.longitude)) {
-          resolve({ lat: coords.latitude, lng: coords.longitude, label: 'Current location' })
-        } else {
-          resolve(mapCenter)
-        }
-      },
-      () => {
-        clearTimeout(fallback)
-        resolve(mapCenter)
-      },
-      { timeout: 2500, maximumAge: 60_000 },
-    )
-  })
-}
-
 export const useTripStore = create<TripState>((set, get) => {
   async function requestRoute(): Promise<void> {
     const { origin, destination } = get()
@@ -154,6 +138,8 @@ export const useTripStore = create<TripState>((set, get) => {
       set({
         routes: result.routes,
         selectedIndex: result.recommendedIndex,
+        recommendedIndex: result.recommendedIndex,
+        hoveredRouteIndex: null,
         tripId: result.tripId,
         status: 'ready',
       })
@@ -181,6 +167,8 @@ export const useTripStore = create<TripState>((set, get) => {
     stops: [],
     routes: [],
     selectedIndex: 0,
+    recommendedIndex: 0,
+    hoveredRouteIndex: null,
     tripId: null,
     status: 'idle',
     errorMessage: null,
@@ -222,6 +210,12 @@ export const useTripStore = create<TripState>((set, get) => {
 
     selectRoute(index) {
       if (index >= 0 && index < get().routes.length) set({ selectedIndex: index })
+    },
+
+    hoverRoute(index) {
+      if (index === null || (index >= 0 && index < get().routes.length)) {
+        set({ hoveredRouteIndex: index })
+      }
     },
 
     refreshRoute() {
@@ -329,6 +323,8 @@ export const useTripStore = create<TripState>((set, get) => {
         stops: [],
         routes: [],
         selectedIndex: 0,
+        recommendedIndex: 0,
+        hoveredRouteIndex: null,
         tripId: null,
         status: 'idle',
         errorMessage: null,

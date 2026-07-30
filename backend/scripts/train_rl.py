@@ -11,13 +11,27 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# Central Arlington, matching data/download_osm.sh — (min_lat, min_lon, max_lat, max_lon).
-REGION_BBOX = (32.715, -97.140, 32.760, -97.080)
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _region_bbox() -> tuple[float, float, float, float]:
+    """(min_lat, min_lon, max_lat, max_lon) from data/region.json.
+
+    Read rather than hard-coded so the graph this trains on always covers the
+    same area the routing tiles were built for — the bbox used to be duplicated
+    here and drifting from it would train on a region that no longer exists.
+    """
+    bbox = json.loads((_REPO_ROOT / "data" / "region.json").read_text())["bbox"]
+    return (bbox["south"], bbox["west"], bbox["north"], bbox["east"])
+
+
+REGION_BBOX = _region_bbox()
 
 
 async def _build_graph():

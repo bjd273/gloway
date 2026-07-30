@@ -34,13 +34,37 @@ Calculates a route and persists it as a `trips` row.
 ```json
 {
   "trip_id": "uuid",
-  "routes": [ /* Valhalla trip 0 = primary, 1..n = alternates, raw Valhalla `trip` objects */ ],
+  "routes": [ /* raw Valhalla `trip` objects — the deduped candidate pool */ ],
   "recommended_index": 0,
   "estimated_minutes": 12.4,
-  "context_summary": "Route calculated based on your preferences."
+  "context_summary": "Route calculated based on your preferences.",
+  "route_labels":     ["Fastest", "No highways", "Another way"],
+  "route_strategies": ["fastest", "avoid_highways", "fastest"],
+  "route_primary":    [true, true, false]
 }
 ```
-`routes[i]` is Valhalla's own response shape (`legs[].shape` polyline6-encoded, `legs[].maneuvers[]`, `summary.{time,length}`) — the backend does not reshape it; the frontend's `parseTrip()` decodes it.
+
+`routes[i]` is Valhalla's own response shape (`legs[].shape` polyline6-encoded,
+`legs[].maneuvers[]`, `summary.{time,length}`) — the backend does not reshape it; the frontend's
+`parseTrip()` decodes it. Requests set `directions_options.narrative`, so maneuvers carry
+`street_names`, which is what lets the client name a route by the road it follows.
+
+The candidates are **not** simply "Valhalla's primary plus its alternates". `routing/candidate_generator.py`
+sweeps several costing strategies concurrently, pools every route each call returns, and de-dupes
+on geometry overlap. The three parallel arrays describe that pool, index-for-index with `routes`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `route_labels` | `string[]` | Display name — `"Fastest"`, `"No highways"`, `"Fewest turns"`, `"Shortest way"`, `"Calmer roads"`, `"No tolls"`. **Not unique**: every alternate Valhalla threw in alongside a strategy is `"Another way"`. Never key on this. |
+| `route_strategies` | `string[]` | Machine key — `"fastest"`, `"avoid_highways"`, `"fewest_turns"`, `"shortest_distance"`, `"relaxed"`, `"avoid_tolls"`. Prefer this over matching labels, which are display copy and expected to get reworded. Mirrored into `trips.context["route_strategies"]`. |
+| `route_primary` | `bool[]` | Whether a strategy actually optimised for this route. `false` means it is an alternate that rode along with some strategy's call — useful variety, but its label carries no information. The frontend uses this to decide between showing the strategy's name and naming the route by its dominant road (`"via S Cooper St"`). |
+
+All three are additive fields with `default_factory=list`, so a client written against an older
+backend degrades rather than breaking.
+
+Under 2 straight-line miles the sweep is skipped entirely and only the baseline strategy runs —
+probing showed no costing knob changes a short route, so the extra calls would only rediscover the
+same road. Expect `["Fastest", "Another way", ...]` on short trips.
 
 **Errors:**
 - `422` — `user_id` not a valid UUID (also standard FastAPI validation errors for malformed body fields).

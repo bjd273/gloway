@@ -50,11 +50,18 @@ def compute_final_reward(implicit: dict | None, explicit: dict | None) -> dict:
     r_e = float(explicit["reward_delta"]) if has_explicit else None
     c_e = float(explicit.get("confidence", 0.0)) if has_explicit else 0.0
 
+    # A zero-confidence explicit signal contributes literally nothing to the
+    # weighted average, so reporting it as "fused" overstates the result — the
+    # first real drive produced reward == implicit exactly while claiming to be
+    # fused. Treat zero weight as absent for provenance, while keeping the raw
+    # value in `components` so nothing is hidden.
+    if has_explicit and c_e <= 0.0:
+        has_explicit = False
+
     if has_implicit and has_explicit:
         w_i, w_e = _IMPLICIT_CONFIDENCE, c_e
         total = w_i + w_e
-        # If the explicit signal has zero confidence, lean fully on implicit.
-        reward = (w_i * r_i + w_e * r_e) / total if total > 0 else r_i
+        reward = (w_i * r_i + w_e * r_e) / total
         source, confidence = "fused", max(_IMPLICIT_CONFIDENCE, c_e)
     elif has_implicit:
         reward, source, confidence = r_i, "implicit_only", _IMPLICIT_CONFIDENCE

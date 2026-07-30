@@ -156,6 +156,66 @@ Lightweight ADRs for choices in this codebase whose reasoning isn't obvious from
 
 **Context:** `infra/docker-compose.yml` lives in `infra/`, but Compose resolves relative volume paths and `.env` against the compose file's own directory by default — not the repo root. Running `docker compose -f infra/docker-compose.yml up` without `--project-directory .` silently fails to resolve `.env` and bind-mount paths.
 
-**Decision:** Always run Compose from the repo root with `--project-directory .` explicitly set: `docker compose -f infra/docker-compose.yml --project-directory . up -d <service>`. Documented in the roadmap and repeated in [Quickstart](README.md#2-bring-up-infrastructure).
+**Decision:** Always run Compose from the repo root with `--project-directory .` explicitly set: `docker compose -f infra/docker-compose.yml --project-directory . up -d <service>`. Documented in the roadmap and repeated in [Setup](setup.md#why-both-flags).
 
 **Consequences:** Every Compose invocation in docs/scripts should carry this flag; a bare `docker compose -f infra/docker-compose.yml up` from any directory is a likely source of "why can't it find my .env" support questions.
+
+---
+
+## Sweep several costing strategies instead of trusting one Valhalla call
+
+**Status:** Adopted (July 2026).
+
+**Context:** Ranking can only choose from what generation produced. Measured on a north–south Arlington pair, one Valhalla call with `alternates=3` returned 13.14 mi, 13.16 mi and 19.44 mi — the first two being the same road with a trivial variation. Asking for six alternates still returned three. The whole personalization stack was therefore choosing between two identical routes and one bad one, and the first real drive went 460 m off-route precisely because the rider's preferred route was never a candidate.
+
+**Decision:** `routing/candidate_generator.py` runs several deliberately different costing strategies concurrently (`use_highways: 0`, `maneuver_penalty: 300`, `shortest`, `top_speed: 45`, `use_tolls: 0`, plus bike/pedestrian variants), pools every route each call returns, and de-dupes on geometry overlap ≥0.8, reusing `compute_route_adherence` rather than writing new geometry code. Every strategy in the list was verified against the live engine to actually change a route; knobs that did nothing on this extract (`use_living_streets`, `use_hills`, `date_time`) were dropped.
+
+**Consequences:** Six concurrent Valhalla calls per request instead of one, which is why trips under 2 straight-line miles skip the sweep — probing found no knob changes a short route. Candidates are ordered strategy-primaries first, then leftovers: ranked purely by arrival order, the baseline's own alternates filled the cap and "no highways" was never even looked at.
+
+---
+
+## `route_primary` over string-matching route labels
+
+**Status:** Adopted (July 2026).
+
+**Context:** Only the route a strategy purpose-built deserves that strategy's name. The alternates Valhalla returns alongside each call are useful variety but are not what the strategy asked for, so they all carry the literal label `"Another way"`. On a short trip, where only the baseline runs, that meant the entire card list read "Fastest" then "Another way" three times — accurate and useless. The `Candidate` dataclass had tracked `is_primary` for exactly this distinction since the sweep was built, but nothing downstream read it.
+
+**Decision:** Surface it as `route_primary: list[bool]` on `RouteResponse`, parallel to the existing `route_labels`/`route_strategies`. The frontend names non-primary routes by the road they spend the most distance on (`"via S Cooper St"`), falling back to a superlative and then to the backend label.
+
+**Consequences:** One more additive response field. The client could instead have matched the literal string `"Another way"`, but labels are display copy the backend explicitly expects to reword — the same reasoning that put `route_strategies` alongside `route_labels` in the first place.
+
+---
+
+## Progress is a fraction of length, not of coordinate count
+
+**Status:** Adopted (July 2026).
+
+**Context:** `DriveController` reported drive progress as `index / (coords.length - 1)` — a fraction of the route's *coordinate count*. MapLibre's `line-progress` addresses a line by fraction of its *length*, and Valhalla packs shape points tightly through curves while spreading them along straights. On a real test route, coordinate 21 of 34 was 62% by index and 45% by distance. Styling the route with the index figure would have put the traveled/remaining boundary visibly away from the puck.
+
+**Decision:** `frontend/src/lib/routeProgress.ts` computes cumulative length fractions in metres, using the same local equirectangular projection `services/signal_processor.py` uses server-side. `DriveController` precomputes them once per route and indexes into them.
+
+**Consequences:** This also silently corrected two existing consumers that already *assumed* distance semantics and were quietly wrong: `TripSheet`'s current-maneuver picker (`navProgress * selected.miles`) and `NavVoice`'s spoken remaining distance. Summing segment lengths lands a few ulps off round numbers, so tests assert with `closeTo` rather than equality — rounding would mean rounding the value `line-progress` consumes.
+
+---
+
+## Heading comes from route geometry, not consecutive GPS fixes
+
+**Status:** Adopted (July 2026).
+
+**Context:** The driving camera rotates so the direction of travel is up, and the position puck carries a heading arrow. Both need a bearing. The obvious source is the delta between consecutive GPS fixes.
+
+**Decision:** Read the bearing off the route's own geometry, looking ~60 m ahead (`bearingAtFraction`).
+
+**Consequences:** A parked car still has a heading. Fix-delta bearing spins randomly at a standstill, and a map that spins at every red light is unusable; averaging over ~60 m of road also smooths the per-shape-point jitter that would wobble the camera through curves. The cost is that a driver who leaves the route keeps being shown the route's heading until they rejoin — acceptable, and the same assumption the greyed-out traveled line already makes.
+
+---
+
+## Sheet snap policy lives in `TripSheet`, not the trip store
+
+**Status:** Adopted (July 2026).
+
+**Context:** Route cards were unreachable: every completed route request called `setSnap('peek')`, collapsing the sheet so the map got the screen, which left the cards rendered into a clipped region. The only way to pick a route was to notice the "N ways" button and tap that first. An initial fix put an auto-raise in `useTripStore.requestRoute()` — and it silently lost, because `TripSheet`'s effect ran afterwards and dropped the sheet straight back to peek.
+
+**Decision:** Keep all snap policy in `TripSheet`, whose existing comment already stated the rule ("how tall a panel is has nothing to do with what the trip is"). `Sheet.tsx` owns mechanism — heights, drag, publishing its measured size — and `TripSheet` owns policy: one route drops to peek, several rises to half, navigating stays at peek.
+
+**Consequences:** Two components writing the same state is a fight the later effect always wins, and the split is what makes that impossible. A related latent bug was fixed alongside: `pointer-events: none` on the collapsed scroll region also killed taps on whatever remained visible.

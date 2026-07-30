@@ -3,13 +3,21 @@ set -e
 
 mkdir -p data/overture
 
-# Same bbox as data/download_osm.sh and frontend/src/lib/region.ts.
+# Bbox comes from data/region.json, the same source data/download_osm.sh and
+# the frontend's coverage gate read — so places can never cover a different
+# area than the routing tiles.
 # Uses the latest Overture release (same "latest" convention as texas-latest
 # in download_osm.sh); pin with `pip install overturemaps==<version>` if
 # reproducibility matters later. Needs the overturemaps CLI: `uvx` runs it
 # ephemeral; otherwise `pipx run overturemaps` or `pip install overturemaps`.
-echo "Downloading Overture places for Central Arlington..."
-uvx overturemaps download --bbox=-97.140,32.715,-97.080,32.760 \
+BBOX=$(python3 -c "
+import json
+b = json.load(open('data/region.json'))['bbox']
+print(f\"{b['west']},{b['south']},{b['east']},{b['north']}\")
+")
+
+echo "Downloading Overture places for $BBOX..."
+uvx overturemaps download --bbox="$BBOX" \
     -f geoparquet --type=place -o data/overture/places.parquet
 
 echo "Verifying the extract..."
