@@ -132,24 +132,28 @@ The frontend is intentionally light on components; almost all logic lives in `st
 
 | Store | Owns | Notable behavior |
 |---|---|---|
-| `useTripStore` | Origin/destination/stops, fetched routes, selection, travel mode, navigation phase/progress, live position | `requestRoute()` is the single place that calls `getRoute()`; every mutation (`setDestination`, `moveEndpoint`, `setMode`, `addStop`, ...) funnels through it or `refreshRoute()`. Owns a non-serializable `DriveController` instance (kept outside React/Zustand state on purpose). |
+| `useTripStore` | Origin/destination/stops, fetched routes, selection, travel mode, navigation phase/progress, live position, **turn guidance**, sim playback speed | `requestRoute()` is the single place that calls `getRoute()`; every mutation (`setDestination`, `moveEndpoint`, `setMode`, `addStop`, ...) funnels through it or `refreshRoute()`. Owns non-serializable `DriveController`, `ManeuverTracker` and `TurnAnnouncer` instances (kept outside React/Zustand state on purpose), all released together by `endDrive()`. `guidance` is the single source of truth for which turn is next — `TripSheet` and `NavVoice` used to re-derive it separately and disagreed. |
 | `useUserStore` | Locally-remembered user id + preferences + journey profile | Preferences are optimistic: set locally, `PATCH`ed, reverted on failure. Persists to `localStorage` under `gloway:user` so the panel renders instantly on reload without a network round trip. |
 | `useConvoStore` | Pre-trip conversation open/reply state | `applyReplyResult()` (exported, not store-internal) is the shared side-effect applier — see below. |
-| `useVoiceStore` | Whether assistant replies are read aloud (`autoSpeak`) | Persisted to `localStorage` under `gloway:voice`; auto-enables itself once, the first time the mic is used. |
+| `useVoiceStore` | Whether assistant replies are read aloud (`autoSpeak`) and whether turns are announced (`voiceGuidance`) | Persisted to `localStorage` under `gloway:voice`. The two are deliberately different: `autoSpeak` starts **off** and auto-enables once, the first time the mic is used; `voiceGuidance` starts **on**, because someone driving unfamiliar roads shouldn't have to find a setting to be told about their exit. Read as `!== false` so the blobs written before the key existed don't parse as a deliberate mute. |
 | `useDebriefStore` | Post-trip debrief conversation | Mirrors `useConvoStore`'s open/reply shape for the debrief flow. |
-| `useSheetStore` | The bottom sheet's snap (`peek`/`half`/`full`) and its **measured** pixel height | Measured rather than computed from `dvh`, because mobile browser chrome slides in and out while driving and that mapping shifts underneath you. A store rather than props because `MapView` is a *sibling* of the sheet and needs the live height for camera padding. |
+| `useSheetStore` | The bottom sheet's snap (`peek`/`half`/`full`) and the **measured** pixel heights of the sheet and the turn banner | Measured rather than computed from `dvh`, because mobile browser chrome slides in and out while driving and that mapping shifts underneath you. A store rather than props because `MapView` is a *sibling* of both and needs the live heights for camera padding. |
 
 The UI is a full-bleed map with glass chrome floating over it: `MapView` at the bottom of the
-stack, then the wordmark, the bottom `Sheet` (whose content is `TripSheet`), the transient
-`AssistantBubble`, and the preferences panel. `TripSheet`'s subtree is **always mounted** and the
-snap height only changes what is visible — unmounting per snap would tear down the WebSocket
-`NavVoice` holds for the duration of a drive.
+stack, then the wordmark, the `TurnBanner` (driving only), the bottom `Sheet` (whose content is
+`TripSheet`), the transient `AssistantBubble`, and the preferences panel. `TripSheet`'s subtree is
+**always mounted** and the snap height only changes what is visible — unmounting per snap would
+tear down the WebSocket `NavVoice` holds for the duration of a drive.
+
+While driving, the banner claims the top strip: the wordmark stands down entirely, and the prefs
+gear and re-centre pill shift below it on mobile. On desktop the banner sits top-left above the
+sheet, one column of chrome down the left with the map to its right.
 
 `stores/useConvoStore.ts`'s exported `applyReplyResult()` function is the single place that turns a backend `ReplyResponse` (or the WebSocket voice `action` payload — same shape) into store mutations: route switch, stop insertion, travel-mode change, destination override, preference sync. Both the HTTP pre-trip reply path and the WebSocket in-drive voice path call it, so a spoken "take me home" mid-drive and a typed "take me home" pre-trip behave identically — see `api/routes/voice.py`'s docstring: *"`action` mirrors the HTTP `ReplyResponse` shape exactly (snake_case), so the frontend reuses the same reply-result parser."*
 
 `lib/api.ts` is the only module that calls `fetch`/opens the WebSocket; every user-facing error string lives there (`FriendlyError`), so components and stores never format raw HTTP details for display.
 
-`lib/navigation.ts`'s `DriveController` is the live position source, with two interchangeable modes behind one pipeline: `real` uses `navigator.geolocation.watchPosition`, and `sim` (selected with `?sim=1`, or automatically when the Geolocation API is missing) walks the route's own coordinates on a timer. Everything downstream — buffering, batched flushes to `/trips/{id}/gps-update`, the puck, the camera, arrival — is identical in both, which is what makes sim an honest stand-in outside the Arlington tile region.
+`lib/navigation.ts`'s `DriveController` is the live position source, with two interchangeable modes behind one pipeline: `real` uses `navigator.geolocation.watchPosition`, and `sim` (selected with `?sim=1`, or automatically when the Geolocation API is missing) advances along the route in metres per second at the route's own pace, with a 1×/4×/8× multiplier. Everything downstream — buffering, batched flushes to `/trips/{id}/gps-update`, the puck, the camera, turn guidance, arrival — is identical in both, which is what makes sim an honest stand-in outside the Arlington tile region.
 
 The progress fraction it emits is a fraction of route **length**, computed in `lib/routeProgress.ts`, not of coordinate count. Valhalla packs shape points tightly through curves and spreads them on straights, so the two diverge badly, and the map's `line-progress` gradients address the line by length — see [ADR: distance-based progress](decisions.md#progress-is-a-fraction-of-length-not-of-coordinate-count).
 
@@ -164,13 +168,13 @@ The progress fraction it emits is a fraction of route **length**, computed in `l
 
 This matters for anyone extending the system — don't assume roadmap ambition equals shipped behavior:
 
-- **Shipped and wired end-to-end:** routing with preference-driven costing; multi-strategy candidate generation and ranking; geocoding/place search; user registration, preferences and journey profile; trip persistence, batched GPS breadcrumbs and completion; live navigation (traveled/remaining route styling, heading-up driving camera, locate control); the pre-trip conversation; the in-drive voice WebSocket; server-side STT fallback; the post-trip debrief; and confidence-weighted reward fusion writing `trips.reward_value`.
+- **Shipped and wired end-to-end:** routing with preference-driven costing; multi-strategy candidate generation and ranking; geocoding/place search; user registration, preferences and journey profile; trip persistence, batched GPS breadcrumbs and completion; live navigation (traveled/remaining route styling, heading-up driving camera, locate control); turn-by-turn guidance (turn banner with maneuver icons, distance-to-turn, lane strip where OSM has `turn:lanes`, and spoken announcements); the pre-trip conversation; the in-drive voice WebSocket; server-side STT fallback; the post-trip debrief; and confidence-weighted reward fusion writing `trips.reward_value`.
 - **Wired but inert until trained:** the supervised route scorer is called on every `POST /route`, but `RouteRanker.from_path()` finds no model until `scripts/train_route_scorer.py` has ≥30 completed trips to learn from, so ranking is behaviour-preserving (Valhalla's own order) in the meantime.
 - **Built and tested, not in any request path:** `ml/gnn/` (road-graph ingestion + GATv2 encoder — and note it is randomly initialised and never trained, so its output is a constant); `ml/rl/environment.py` + `train.py` (a PPO navigation policy that demonstrably learns, but which nothing serves); `ml/rl/preference_embedding.py`. `UserPreference.preference_vector` and `UserJourneyProfile.driving_persona`/`known_regular_routes` columns exist but nothing writes non-null values into them.
 - **Declared in `docker-compose.yml`, absent from the code:** the Celery task queue and Redis caching. Also note `backend` and `celery_worker` cannot build — there is no `backend/Dockerfile`.
 - **In the roadmap only:** federated learning (Flower), dashcam-based map updates.
 
-The single biggest blocker is not modelling. `watchPosition` and `getUserMedia` are secure-context-only, so collecting real drive data at all requires an HTTPS origin (`./scripts/drive.sh`). A simulated drive replays the suggested route's own coordinates, which makes `adherence_rate` 1.0 by construction and the implicit reward information-free.
+The single biggest blocker is not modelling. `watchPosition` and `getUserMedia` are secure-context-only, so collecting real drive data at all requires an HTTPS origin (`./scripts/drive.sh`). A simulated drive follows the suggested route's own geometry, which makes `adherence_rate` 1.0 by construction and the implicit reward information-free — the speed-based sim makes the *timing* realistic, not the trace.
 
 ## Related pages
 

@@ -219,3 +219,76 @@ Lightweight ADRs for choices in this codebase whose reasoning isn't obvious from
 **Decision:** Keep all snap policy in `TripSheet`, whose existing comment already stated the rule ("how tall a panel is has nothing to do with what the trip is"). `Sheet.tsx` owns mechanism — heights, drag, publishing its measured size — and `TripSheet` owns policy: one route drops to peek, several rises to half, navigating stays at peek.
 
 **Consequences:** Two components writing the same state is a fight the later effect always wins, and the split is what makes that impossible. A related latent bug was fixed alongside: `pointer-events: none` on the collapsed scroll region also killed taps on whatever remained visible.
+
+---
+
+## Turn lanes come from a second OSRM-format call, not the native response
+
+**Status:** Adopted (July 2026).
+
+**Context:** Lane guidance ("use the left 2 lanes") needs `turn:lanes` from OSM. Valhalla's documentation describes a top-level `turn_lanes` request flag that adds a `lanes` array to each maneuver. On the pinned build (3.5.1, `ghcr.io/gis-ops/docker-valhalla`) that flag is accepted and silently ignored — the native JSON response carries no lane data at all. Lanes appear only when the response is requested in Valhalla's OSRM-compatible dialect, as `steps[].intersections[].lanes`.
+
+Switching the routing call wholesale to OSRM format was not available. `trips.suggested_route` stores the raw native trip, and `services/signal_processor.py` and `ml/training/train_route_scorer.py` both read that shape back out to score every completed drive. Changing it would have invalidated stored trips and two consumers well outside this feature.
+
+**Decision:** `routing/lane_guidance.py` issues a second, concurrent OSRM-format call per routing strategy and grafts only the `lanes` array onto the matching native maneuvers. The native response stays the system of record.
+
+**Consequences:** Roughly double the Valhalla requests per route. Both calls are concurrent and Valhalla is local, so the wall-clock cost is small, and the harvest is best-effort — any failure leaves the route intact without lanes. The graft is guarded: it checks leg count, duration and maneuver count agree before matching, because wrong lane data is worse than none. It points a driver at a real lane that happens to be the wrong one, and a driver who follows it ends up somewhere unrecoverable. On a mismatch the lanes are dropped.
+
+Lane coverage is a property of OSM, not of this code. Across the Arlington extract, arterials and highway approaches carry `turn:lanes` and residential streets do not, so most maneuvers have no lanes. The banner is designed around their absence — the strip renders nothing rather than reserving space.
+
+---
+
+## Maneuver boundaries come from `begin_shape_index`, not `end_shape_index`
+
+**Status:** Adopted (July 2026).
+
+**Context:** Valhalla gives each maneuver a span over the route's shape points. `begin_shape_index` is where its instruction is carried out; `end_shape_index` is where that span hands over to the next maneuver. The two meet, so `end[N] === begin[N+1]`:
+
+```
+0: "Drive north on South Pecan Street."   begin=0  end=12
+1: "Turn left onto West Mitchell Street." begin=12 end=34
+```
+
+The first implementation built the countdown targets from `end`. That is the correct *point* — shape index 12 really is where the left turn happens — but it pairs that point with maneuver 0, the road being driven, rather than maneuver 1, the turn being approached. Because the two lists differ by exactly one position, every instruction displayed and was spoken one turn late: the banner read "turn left onto West Mitchell" while the driver was already on West Mitchell, and the announcement arrived just after the turn was completed. The distance was correct throughout, which is what made it hard to see in the numbers.
+
+**Decision:** `stepBoundaries()` maps each maneuver to `cumulative[beginShapeIndex]` — the distance at which it is performed. `ManeuverTracker` reports the first maneuver whose point is still ahead of the driver.
+
+**Consequences:** `stepIndex` now means "the turn being approached", which is what both the banner and the announcer want, and `steps[stepIndex]` needs no offsetting at the call site. Boundary 0 is the departure at distance 0, so the tracker's first update walks straight past it onto the first real turn — correct, since a driver pulling away wants the turn ahead, not a description of the road they are on. The distance-based fallback (for maneuvers with no shape indices) had to become an *exclusive* prefix sum to match: boundary N is where step N starts.
+
+---
+
+## The step tracker only moves forward
+
+**Status:** Adopted (July 2026).
+
+**Context:** `DriveController` finds each GPS fix's nearest route coordinate by scanning the entire line. On a loop-shaped route, or on either side of a U-turn where two opposite stretches of road sit metres apart, one noisy fix can project onto a coordinate the driver passed ten minutes ago.
+
+**Decision:** `ManeuverTracker` holds its step index against any backwards movement. The distance readout is floored at the previous maneuver but not held at a high-water mark.
+
+**Consequences:** A stale projection can no longer re-announce a turn already taken or flip the banner back to an instruction the driver has finished obeying — the two worst failures a turn banner has. Within a step the honest projection still wins, so drifting or backing up reads truthfully. A genuine reroute doesn't rewind the tracker either: `startNavigation` throws it away and builds a new one, which is also what stops a post-reroute drive from replaying announcements for turns already made.
+
+---
+
+## Simulated drives move in metres per second, not in fractions of the route
+
+**Status:** Adopted (July 2026), replacing the fixed-duration sim.
+
+**Context:** The simulator advanced by `stride = coords.length / 45`, covering any route in ~36 seconds regardless of length. That was fine while the sim only had to move a puck. It is useless for turn-by-turn: on a 10-mile route each 800 ms tick covered about a quarter mile, so a "turn in 500 feet" countdown jumped straight to zero with nothing in between, and no announcement threshold could be crossed in a meaningful place.
+
+**Decision:** The sim advances `metresPerSecond × elapsed`, taking its speed from the route's own per-step timings, and interpolates *within* a segment rather than snapping to shape points. A persisted 1×/4×/8× multiplier is read through a closure on every tick.
+
+**Consequences:** A simulated drive now takes about as long as the real one at 1×, which is the setting for judging whether a countdown reads believably. 4× is the default because sitting through a 25-minute route is not a development loop. Reading the multiplier per tick rather than capturing it means changing speed mid-drive takes effect on the next tick with no restart. Interpolating matters more than it sounds: without it the countdown would quantise to Valhalla's shape-point spacing, which on a straight is 100 m or more. `driveDurationMinutes()` still reports `null` for sim drives — the multiplier makes wall-clock time a measurement of the UI setting rather than of the route.
+
+---
+
+## Turn announcements fire on threshold crossings, and outrank conversation
+
+**Status:** Adopted (July 2026).
+
+**Context:** Two problems. First, a level test ("are we within half a mile?") fires the moment a drive starts, because the first maneuver is routinely a few hundred metres from where the car is parked — the driver would hear "in a half mile, turn right" while still on the driveway. Second, `speak()` called `speechSynthesis.cancel()` unconditionally, so any utterance cut off any other: a turn announcement could decapitate an assistant reply, and an assistant reply could cut off "turn right onto Coop—" mid-word.
+
+**Decision:** `TurnAnnouncer` fires only on a *downward crossing* of each threshold, once per step, and checks the near threshold before the far one. `speak()` takes a priority: `'turn'` still cancels, `'chat'` now waits for an in-flight turn and is dropped if it goes stale.
+
+**Consequences:** A drive that begins inside the warning distance stays quiet until the turn itself, and a reroute that lands the driver mid-route announces nothing for the steps it skipped — a fresh announcer has seen no crossings. Checking the near threshold first matters when one update jumps past both, which an 8× sim tick or a GPS gap under an overpass will do: the urgent line is the one worth saying, and marking the warning spent stops it arriving after the turn it was warning about. Priority defaults to `'chat'`, so the three existing call sites behave exactly as before.
+
+`voiceGuidance` is a separate preference from `autoSpeak` in both storage and default — `autoSpeak` reads the assistant aloud and starts off, `voiceGuidance` speaks turns and starts on. Because the key was added to an existing persisted blob, it is read as `parsed.voiceGuidance !== false` rather than `Boolean(...)`: absent means "never chose", and reading it as false would have shipped the feature muted to exactly the people who had used the app before.

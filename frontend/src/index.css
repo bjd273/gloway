@@ -368,7 +368,10 @@ body {
     bottom: 14px;
     width: 360px;
     height: auto;
-    max-height: min(72dvh, 640px);
+    /* The banner shares this column while driving, so give way to it rather
+       than growing underneath it. --gw-banner-h is 0 outside a drive, which
+       leaves the original min(72dvh, 640px) untouched. */
+    max-height: min(72dvh, 640px, calc(100dvh - var(--gw-banner-h, 0px) - 44px));
     border-radius: 14px;
     padding: 0 16px 16px;
     touch-action: auto;
@@ -1570,13 +1573,16 @@ body[data-prefs-open] .gw-bubble {
   animation: banner-in 0.24s ease;
 }
 
-/* Desktop parks the sheet in the left corner (see fitPadding's left: 390), so
-   the banner clears it rather than fighting for the same column. */
+/* Desktop stacks the banner directly above the sheet in the left column, at
+   the sheet's own width — one column of chrome down the left, map to the
+   right, rather than two floating cards at different insets. The sheet is
+   bottom-anchored (left: 14px, bottom: 14px, width: 360px) so the two meet
+   only on a short window, which .sheet's max-height below accounts for. */
 @media (min-width: 768px) {
   .turn-banner {
-    left: 406px;
+    left: 14px;
     right: auto;
-    max-width: 520px;
+    width: 360px;
   }
 }
 
@@ -1771,6 +1777,18 @@ body[data-prefs-open] .gw-bubble {
 .map-recenter--below-banner,
 .prefs-button--below-banner {
   top: calc(max(14px, env(safe-area-inset-top)) + var(--gw-banner-h, 0px) + 10px);
+}
+
+/* Desktop moves the banner into the left column, so the top-right gear no
+   longer has anything to clear and returns to its usual place. Must sit after
+   the rule above, not inside the banner's own media block: same specificity,
+   so source order decides. The re-centre pill keeps its offset — it is
+   horizontally centred, which at narrower desktop widths still runs into the
+   banner's right edge. */
+@media (min-width: 768px) {
+  .prefs-button--below-banner {
+    top: max(14px, env(safe-area-inset-top));
+  }
 }
 
 @keyframes recenter-in {

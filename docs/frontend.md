@@ -142,16 +142,25 @@ paint-only and idempotent because it runs on every GPS fix. `progress` is a frac
 ```
 DriveController ──onPosition──▶ useTripStore.currentPosition ──▶ MapView puck
        │         ──onProgress──▶ useTripStore.navProgress   ──▶ setRouteProgress
-       │                                                     ──▶ TripSheet progress bar
-       │                                                     ──▶ NavVoice remaining time
+       │                     │                               ──▶ TripSheet progress bar
+       │                     │
+       │                     └▶ ManeuverTracker ──▶ useTripStore.guidance ──▶ TurnBanner
+       │                                        │                          ──▶ TripSheet step
+       │                                        │                          ──▶ NavVoice context
+       │                                        └▶ TurnAnnouncer ──▶ speak(text, 'turn')
        └──batched every 3s──────▶ POST /trips/{id}/gps-update
 ```
 
 `DriveController` has two position sources sharing one downstream pipeline:
 
 - **`real`** — `navigator.geolocation.watchPosition`. Requires a secure context.
-- **`sim`** — walks the route's own coordinates on a timer (~36 s per route). Selected with
+- **`sim`** — advances in **metres per second** at the route's own pace, interpolating within
+  each segment, with a persisted 1×/4×/8× multiplier read fresh on every tick. Selected with
   `?sim=1`, or automatically when the Geolocation API is missing.
+
+  The sim used to cover any route in a fixed ~36 s. That made a distance-to-turn countdown
+  meaningless — a quarter mile per tick on a long route — so it now moves at a real speed. 1× is
+  the setting for judging whether a countdown looks believable; 4× is the default.
 
 Buffering, batch flushes, the puck, and arrival are identical in both modes, which is what makes
 sim an honest stand-in. On arrival the controller flushes the tail **before** announcing, because
@@ -170,6 +179,85 @@ cumulative metres:
 - `bearingAtFraction(...)` — compass bearing from the route's **geometry**, looking ~60 m ahead,
   not from consecutive GPS fixes. A fix-delta bearing spins randomly at a standstill and a map
   that spins at every red light is unusable.
+
+## Turn-by-turn guidance
+
+The instructions were always in the response; until this landed nothing surfaced them at the
+moment they mattered. The whole in-drive UI was one bolded `<li>` in a list the sheet clips at its
+`peek` snap, and no part of the app tracked which step the driver was on — `TripSheet` and
+`NavVoice` each re-derived it from cumulative miles, in duplicated loops that disagreed at leg
+boundaries and could not detect a step *transition*.
+
+### One source of truth
+
+`useTripStore.guidance` is `{ stepIndex, metersToManeuver, nextStepIndex }`, recomputed on every
+position update and cleared on every path that ends a drive. Both former derivations now read it.
+
+It is derived in the store's `onProgress` handler rather than through a new `DriveController`
+callback: `fraction × routeMeters` *is* the distance driven, in both modes, by construction. A
+parallel channel would be a second source for one number, free to drift from the first.
+
+The announcement side-effect fires there too, not in a React effect keyed on `guidance` — once per
+position update, deterministically, with no dependence on render timing or StrictMode's double
+invocation.
+
+`maneuverTracker`, `turnAnnouncer` and `routeMeters` are module-scoped beside `driveController`,
+for the same reason it is: they are mutable machines, not rendered state. All four are released
+together by `endDrive()`, because a tracker outliving its drive hands the next trip a step index
+from the last one.
+
+### Which end of a maneuver you measure to
+
+Valhalla spans each maneuver from `begin_shape_index` to `end_shape_index` and performs its
+instruction at **begin**, so `end[N] === begin[N+1]`. Building boundaries from `end` lands on the
+right point but pairs it with the previous maneuver's words, and every instruction arrives one turn
+late. `stepBoundaries()` uses `begin`. See `docs/decisions.md`.
+
+### Modules
+
+| File | Role |
+|---|---|
+| `lib/maneuvers.ts` | `stepBoundaries()` — distance at which each maneuver is performed. `ManeuverTracker` — forward-only step tracking. Pure; no React, no browser. |
+| `lib/maneuverIcons.ts` | 40-odd Valhalla type enums collapsed to ~12 stroked SVG paths. Left-handed shapes only; right-hand turns render the mirror, so "right" is guaranteed to be the reflection of "left". Never throws on an unseen type — a missing icon is a plain arrow, a thrown error mid-drive is a blank screen. |
+| `lib/lanes.ts` | `decodeLanes()` / `laneHint()`. Arrows come out in **road order**, left to right, which is the data rather than a presentation detail — a lane painted "left + through" must render `← ↑` in that order. |
+| `lib/navAnnounce.ts` | `TurnAnnouncer` — speaks Valhalla's `verbal_*` strings on downward threshold crossings, once per step. |
+| `components/TurnBanner.tsx` | The card. Reads `guidance`, renders arrow, distance, instruction, "then" cue, lane strip. |
+
+Nothing in the icon layer inspects instruction text. Picking an arrow by searching the English for
+"left" breaks the first time Valhalla rewords a phrase, breaks harder under a non-English
+`language`, and quietly picks wrong on "keep left to stay on I-30 toward Dallas".
+
+### The banner owns the top strip
+
+It floats over the map, not in the sheet: the sheet is pinned to `peek` while driving, so anything
+inside it is clipped or down by the driver's knee, and this is the one thing on screen that has to
+be legible at a glance.
+
+- Stacking is `z-index: 22` — above the wordmark (20), below the sheet (25), so the sheet can be
+  dragged over it and that is the right precedence.
+- Mobile: full width at the top. `Wordmark` returns `null` while navigating, and the prefs gear
+  (30) and re-centre pill (24) shift below the banner — without that the gear renders *on top* of
+  the banner and covers its mute button.
+- Desktop (≥768px): 360px wide in the top-left, directly above the sheet, forming one column of
+  chrome down the left with the map to its right. The gear needs no offset there, and `.sheet`'s
+  `max-height` subtracts the banner so the two never meet on a short window.
+- The banner publishes its **border-box** height to `useSheetStore.bannerPx` and to a
+  `--gw-banner-h` custom property. `contentRect` is wrong here: it excludes 26px of padding and
+  border, and anything positioned against a too-short banner tucks under its bottom edge.
+- `MapView.navPadding()` adds that height, or the banner covers the road ahead — the only part of
+  the map a 55° pitch exists to show.
+
+No `aria-live` on the banner itself: the distance changes every second and a screen reader would
+recite the card for the entire drive. A separate `.gw-sr-only` region announces the instruction,
+and only when `stepIndex` changes.
+
+### Lane guidance is the exception, not the rule
+
+`turn:lanes` is an OSM property. Across the Arlington extract, arterials and highway approaches
+have it and residential streets do not, so most maneuvers carry no lanes — the strip renders
+nothing rather than reserving space, and an all-invalid strip is hidden too (far likelier bad data
+than a junction you genuinely cannot turn at). The backend harvests lanes from a second
+OSRM-format Valhalla call; see `docs/backend.md`.
 
 ## Camera modes
 

@@ -98,7 +98,7 @@ Overture directly.
 
 ## `routing/`
 
-Three modules, in the order a request touches them.
+Four modules, in the order a request touches them.
 
 **`valhalla_client.py`** — `ValhallaRouter`, an HTTP client over the Valhalla service, plus the
 `UserRoutingPrefs` → `costing_options` translation. Requests carry
@@ -122,6 +122,26 @@ Two details that shape what the user sees:
   inherit the strategy's label, so they are all labelled `"Another way"` — and the frontend uses
   `is_primary` (surfaced as `route_primary`) to decide whether to show the strategy name or name
   the route by the road it mostly follows.
+
+**`lane_guidance.py`** — turn lanes, for the frontend's lane strip ("use the left 2 lanes").
+
+Valhalla's documented top-level `turn_lanes` flag does nothing on the pinned build (3.5.1): it is
+accepted and silently ignored, and the native JSON response carries no lane data at all. Lanes
+exist only in Valhalla's OSRM-compatible dialect, as `steps[].intersections[].lanes`.
+
+Switching the routing call to OSRM format wholesale was not an option — `trips.suggested_route`
+stores the raw native trip, and both `services/signal_processor.py` and
+`ml/training/train_route_scorer.py` read that shape back out to score completed drives. So this
+module makes a second, concurrent OSRM-format call per strategy and grafts only the lanes onto the
+matching native maneuvers. The native response stays the system of record.
+
+The graft is guarded: leg count, duration and maneuver count must agree before any lane is
+attached, and on a mismatch the lanes are dropped. Wrong lane data is worse than none — it points
+a driver at a real lane that happens to be the wrong one. The harvest is best-effort throughout; a
+failure leaves the route intact without lanes.
+
+Coverage is a property of OSM. On the Arlington extract, arterials and highway approaches carry
+`turn:lanes` and residential streets do not, so most maneuvers have no lanes at all.
 
 **`route_ranker.py`** — scores the candidate pool for a specific user via `ml/rl/route_scorer.py`
 and returns a `recommended_index`. Behaviour-preserving until a model is trained: no model means
