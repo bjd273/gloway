@@ -29,17 +29,30 @@ _PREFIX = 75.0
 _WORD_START = 50.0
 _SUBSTRING = 25.0
 
-# How much of a band a place can claw back by being close. Under the 25-point
-# gap between bands by design.
-_MAX_DISTANCE_BONUS = 20.0
+# Bonuses that break ties within a band. Their sum stays under the 25-point gap
+# between bands, so no amount of being near or being short can promote a weaker
+# kind of match over a stronger one.
+_MAX_DISTANCE_BONUS = 10.0
 # Beyond this the bonus is flat: everything outside the region is equally far.
 _DISTANCE_SCALE_KM = 25.0
 
-# Fields other than the formatted string that can carry a match, and what a hit
-# there is worth relative to a hit on the name. A brand match is nearly as good
-# as a name match ("walmart" -> "Store #4471"); a category match is a weak
-# signal ("coffee" -> a cafe) and must never outrank a real name hit.
-_FIELD_WEIGHTS = (("name", 1.0), ("brand", 0.9), ("category", 0.35))
+# How much of the name the query accounts for. Without it, "parks mall" ties
+# "The Parks Mall at Arlington" with every tenant that has the mall's name
+# inside its own ("Candy Crave N More Parks Mall"), and the mall itself lands
+# below its own food court. A name that is mostly the query is the place being
+# named; a name that merely contains it is something at that place.
+_MAX_COVERAGE_BONUS = 12.0
+
+# What a hit on each field is worth relative to a hit on the name. A brand match
+# is nearly as good as a name match ("walmart" -> "Store #4471"); a category
+# match is a weak signal ("coffee" -> some cafe) and must never outrank a real
+# name hit.
+_FIELD_WEIGHTS = (("brand", 0.9), ("category", 0.35))
+
+# The formatted string is "Name, street, city", so a query can match it via the
+# address alone. That has to score below a name hit or every tenant on Parks
+# Mall Drive ties with The Parks Mall itself — which is what happened.
+_FORMATTED_WEIGHT = 0.5
 
 
 def normalize(text: str) -> str:
@@ -82,9 +95,23 @@ def _distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return math.hypot(dx, dy)
 
 
+def display_name(address: Address) -> str:
+    """The place's own name, without the address trailing it.
+
+    Sources that have a name field say so in metadata. Nominatim doesn't, but
+    its display_name leads with the place, so the first comma-separated part is
+    the closest equivalent.
+    """
+    name = address.metadata.get("name") if address.metadata else None
+    if isinstance(name, str) and name:
+        return name
+    return address.formatted.split(",")[0]
+
+
 def score_address(query: str, address: Address, centre: tuple[float, float] | None) -> float:
     """Best field score for this result, plus a bonus for being nearby."""
-    best = match_score(query, address.formatted)
+    best = match_score(query, display_name(address))
+    best = max(best, match_score(query, address.formatted) * _FORMATTED_WEIGHT)
     for field, weight in _FIELD_WEIGHTS:
         value = address.metadata.get(field) if address.metadata else None
         if isinstance(value, str):
@@ -93,7 +120,11 @@ def score_address(query: str, address: Address, centre: tuple[float, float] | No
         # The source matched on something not scored here (an address line, an
         # alternate name). Keep it — it is still a real hit — but below
         # everything that matched a scored field.
-        best = 1.0
+        return 1.0
+
+    name = normalize(display_name(address))
+    coverage = len(normalize(query)) / len(name) if name else 0.0
+    best += _MAX_COVERAGE_BONUS * min(coverage, 1.0)
 
     if centre is None:
         return best

@@ -18,7 +18,7 @@ import asyncio
 
 from mapdata.base import MapDataSource
 from mapdata.models import Address, BBox, Place, PlaceCategory, RoutingGraphRef
-from mapdata.ranking import normalize, rank_addresses
+from mapdata.ranking import display_name, normalize, rank_addresses
 
 # Two results closer than this (~50 m) are the same real-world place...
 _DEDUPE_DEGREES = 0.0005
@@ -42,12 +42,9 @@ _CANDIDATE_MULTIPLIER = 4
 
 
 def _name_of(address: Address) -> str:
-    name = (address.metadata or {}).get("name")
-    if isinstance(name, str) and name:
-        return normalize(name)
-    # Nominatim has no separate name field, but its display_name leads with the
-    # place, so the first comma-separated part is the closest equivalent.
-    return normalize(address.formatted.split(",")[0])
+    # Same notion of "the place's own name" the ranker scores on, so dedupe and
+    # ranking can't disagree about what two results are called.
+    return normalize(display_name(address))
 
 
 def _within(a: Address, b: Address, degrees: float) -> bool:

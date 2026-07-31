@@ -24,6 +24,12 @@ const PITCH_OUT_ZOOM = 15.5
 // reach it; bearing tracks the route so "ahead" is always up.
 const NAV_ZOOM = 16.8
 const NAV_PITCH = 55
+
+// The basemap's POI label layers, from mapStyle{Light,Dark}.json. Tapping one
+// sets it as the destination. Kept in sync by hand with the style — if a layer
+// is renamed there, the click silently stops working for that rank, so the
+// names are asserted at map load (see the warning below).
+const POI_LAYERS = ['poi_r20', 'poi_r7', 'poi_r1', 'poi_transit']
 // Shorter than the tightest gap between position updates (sim ticks at 800ms,
 // real fixes are throttled to 1000ms) so each ease lands before the next one
 // starts. Overlapping eases read as the camera drifting rather than tracking.
@@ -250,6 +256,41 @@ export function MapView() {
     })
     map.on('mouseleave', ALT_LAYER, () => {
       map.getCanvas().style.cursor = ''
+    })
+
+    // Tapping a place label routes to it. The map draws thousands of labels
+    // the search index may spell differently or not carry at all, and until now
+    // the only way to pick one was to type its name and hope — a driver hit
+    // exactly that. Reading the destination straight off the feature under the
+    // finger sidesteps the question of whether the two datasets agree.
+    map.on('click', POI_LAYERS, (e) => {
+      // Not mid-drive: the map is the road ahead then, and a stray thumb should
+      // not replace where you're going.
+      if (navigatingRef.current) return
+      const feature = e.features?.[0]
+      if (!feature || feature.geometry.type !== 'Point') return
+      const [lng, lat] = feature.geometry.coordinates as [number, number]
+      const name = feature.properties?.name
+      useTripStore.getState().setDestination({
+        lng,
+        lat,
+        label: typeof name === 'string' && name ? name : 'Dropped pin',
+      })
+    })
+    map.on('mouseenter', POI_LAYERS, () => {
+      if (!navigatingRef.current) map.getCanvas().style.cursor = 'pointer'
+    })
+    map.on('mouseleave', POI_LAYERS, () => {
+      map.getCanvas().style.cursor = ''
+    })
+
+    // A renamed layer in the style would make tap-to-route quietly stop working
+    // for that rank, with nothing to see. Say so once at load instead.
+    map.once('load', () => {
+      const missing = POI_LAYERS.filter((id) => !map.getLayer(id))
+      if (missing.length) {
+        console.warn(`[MapView] POI layers missing from the style: ${missing.join(', ')} — tapping those labels will not set a destination.`)
+      }
     })
 
     return () => {

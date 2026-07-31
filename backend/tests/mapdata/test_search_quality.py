@@ -72,6 +72,28 @@ def test_distance_breaks_ties_but_never_crosses_a_band():
     assert ranked[0] is far_exact
 
 
+def test_the_place_itself_outranks_things_named_after_it():
+    # The mall's own name and every tenant's name contain "Parks Mall", so all
+    # of them land in the same match band. Without a specificity tiebreak the
+    # mall sorted below its own food court.
+    mall = _addr("The Parks Mall at Arlington")
+    tenants = [
+        _addr("Candy Crave N More Parks Mall"),
+        _addr("Yummy Cup Corn & Wassup Dog The Parks mall at Arlington"),
+        _addr("The B12 Store @ The Parks Mall at Arlington"),
+    ]
+    assert rank_addresses("parks mall", [*tenants, mall], (32.71, -97.125))[0] is mall
+
+
+def test_a_shop_on_a_street_named_after_a_place_ranks_below_it():
+    mall = _addr("The Parks Mall at Arlington")
+    on_that_street = Address(
+        id="tenant", formatted="Body Play, 3811 Parks Mall Dr, Arlington",
+        lat=32.71, lon=-97.125, source="test", metadata={"name": "Body Play"},
+    )
+    assert rank_addresses("parks mall", [on_that_street, mall], None)[0] is mall
+
+
 def test_nearer_of_two_equal_matches_wins():
     centre = (32.71, -97.125)
     near = _addr("Walmart", lat=32.712, lon=-97.126)
