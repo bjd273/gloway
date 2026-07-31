@@ -13,19 +13,29 @@ const STORAGE_KEY = 'gloway:voice'
 interface StoredVoice {
   autoSpeak: boolean
   everUsedVoice: boolean
+  voiceGuidance: boolean
 }
+
+const DEFAULTS: StoredVoice = { autoSpeak: false, everUsedVoice: false, voiceGuidance: true }
 
 function loadStored(): StoredVoice {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
-    if (!raw) return { autoSpeak: false, everUsedVoice: false }
+    if (!raw) return { ...DEFAULTS }
     const parsed = JSON.parse(raw)
     return {
       autoSpeak: Boolean(parsed.autoSpeak),
       everUsedVoice: Boolean(parsed.everUsedVoice),
+      // Not Boolean(...), unlike its neighbours: this key was added after
+      // people already had a blob in localStorage, and every one of those
+      // blobs is missing it. Reading absent as false would ship turn
+      // announcements switched off to exactly the users who have driven
+      // before. Absent means "never chose", and the default is on — so only an
+      // explicit false mutes it.
+      voiceGuidance: parsed.voiceGuidance !== false,
     }
   } catch {
-    return { autoSpeak: false, everUsedVoice: false }
+    return { ...DEFAULTS }
   }
 }
 
@@ -36,27 +46,48 @@ function persist(state: StoredVoice): void {
 interface VoiceState {
   autoSpeak: boolean
   everUsedVoice: boolean
+  /**
+   * Whether to speak turn-by-turn guidance while driving. Deliberately separate
+   * from autoSpeak, in default and in meaning: autoSpeak reads the assistant's
+   * conversation aloud and starts off, while this announces turns and starts
+   * on — someone driving unfamiliar roads should not have to discover a setting
+   * to be told about their exit.
+   */
+  voiceGuidance: boolean
   /** Call when the mic is tapped. One-time auto-enable of read-aloud. */
   noteVoiceUsed(): void
   setAutoSpeak(value: boolean): void
+  setVoiceGuidance(value: boolean): void
 }
 
 const stored = loadStored()
 
-export const useVoiceStore = create<VoiceState>((set, get) => ({
-  autoSpeak: stored.autoSpeak,
-  everUsedVoice: stored.everUsedVoice,
+export const useVoiceStore = create<VoiceState>((set, get) => {
+  const snapshot = (): StoredVoice => ({
+    autoSpeak: get().autoSpeak,
+    everUsedVoice: get().everUsedVoice,
+    voiceGuidance: get().voiceGuidance,
+  })
 
-  noteVoiceUsed() {
-    if (get().everUsedVoice) return
-    const next = { autoSpeak: true, everUsedVoice: true }
-    persist(next)
-    set(next)
-  },
+  return {
+    autoSpeak: stored.autoSpeak,
+    everUsedVoice: stored.everUsedVoice,
+    voiceGuidance: stored.voiceGuidance,
 
-  setAutoSpeak(value) {
-    const next = { autoSpeak: value, everUsedVoice: get().everUsedVoice }
-    persist(next)
-    set({ autoSpeak: value })
-  },
-}))
+    noteVoiceUsed() {
+      if (get().everUsedVoice) return
+      set({ autoSpeak: true, everUsedVoice: true })
+      persist(snapshot())
+    },
+
+    setAutoSpeak(value) {
+      set({ autoSpeak: value })
+      persist(snapshot())
+    },
+
+    setVoiceGuidance(value) {
+      set({ voiceGuidance: value })
+      persist(snapshot())
+    },
+  }
+})

@@ -39,16 +39,31 @@ export function metersBetween(a: [number, number], b: [number, number]): number 
  * zeros rather than NaN, so callers never have to guard the divide.
  */
 export function lengthFractions(coords: [number, number][]): number[] {
-  const fractions = new Array<number>(coords.length).fill(0)
+  const fractions = cumulativeMeters(coords)
   if (coords.length < 2) return fractions
-  let total = 0
-  for (let i = 1; i < coords.length; i += 1) {
-    total += metersBetween(coords[i - 1], coords[i])
-    fractions[i] = total
-  }
+  const total = fractions[fractions.length - 1]
   if (total === 0) return fractions.fill(0)
   for (let i = 1; i < coords.length; i += 1) fractions[i] /= total
   return fractions
+}
+
+/**
+ * Cumulative metres travelled at each coordinate — the un-normalised half of
+ * `lengthFractions`, which divides this away and throws the scale out.
+ *
+ * Turn guidance needs the metres themselves. "Turn right in 500 feet" cannot be
+ * recovered from two fractions without the route's total length tagging along,
+ * and passing that around separately is how the two get out of step.
+ *
+ * Index-parallel to `coords`, always, so a nearest-point index reads straight
+ * in. A degenerate route comes back all zeros rather than NaN.
+ */
+export function cumulativeMeters(coords: [number, number][]): number[] {
+  const meters = new Array<number>(coords.length).fill(0)
+  for (let i = 1; i < coords.length; i += 1) {
+    meters[i] = meters[i - 1] + metersBetween(coords[i - 1], coords[i])
+  }
+  return meters
 }
 
 /** Index of the last coordinate at or before `fraction`. Binary search: this

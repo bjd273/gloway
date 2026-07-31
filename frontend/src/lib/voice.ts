@@ -90,17 +90,80 @@ export function listEnglishVoiceNames(): string[] {
   return cachedVoices.filter((v) => v.lang.toLowerCase().startsWith('en')).map((v) => v.name)
 }
 
-/** Speaks text aloud with the preferred male voice, cancelling any utterance
- * already in flight — replies can arrive back-to-back and should never
- * overlap. No-ops silently if the browser doesn't support SpeechSynthesis. */
-export function speak(text: string): void {
+/**
+ * What kind of thing is being said, which decides who wins a collision.
+ *
+ * 'turn' is navigation guidance; 'chat' is the assistant talking. Before this
+ * existed every utterance cancelled every other one, so a turn announcement
+ * could decapitate an LLM reply and — much worse — a reply about the weather
+ * could cut off "turn right onto Coop—" mid-word.
+ */
+export type SpeechPriority = 'chat' | 'turn'
+
+/** What is being spoken right now, null when the synth is idle. */
+let speaking: SpeechPriority | null = null
+/** A chat line held back while a turn is being announced. */
+let deferred: { text: string; at: number } | null = null
+
+/** A reply queued behind a turn announcement is stale by the time the road is
+ * quiet again; speaking it then is more confusing than dropping it. Turn
+ * announcements run 2-4s, so this rarely bites. */
+const DEFERRED_TTL_MS = 8000
+
+function drainDeferred(): void {
+  const pending = deferred
+  deferred = null
+  if (pending && Date.now() - pending.at < DEFERRED_TTL_MS) speak(pending.text, 'chat')
+}
+
+/**
+ * Speaks text aloud with the preferred male voice. No-ops silently if the
+ * browser doesn't support SpeechSynthesis.
+ *
+ * Same-priority utterances still cancel each other — replies arrive
+ * back-to-back and shouldn't overlap. Across priorities, a turn interrupts
+ * chat (missing an exit is worse than a truncated pleasantry) but chat waits
+ * for a turn to finish.
+ */
+export function speak(text: string, priority: SpeechPriority = 'chat'): void {
   if (!isSpeechSynthesisSupported() || !text.trim()) return
   if (!preferredVoice) refreshVoices() // late-load if voices weren't ready earlier
+
+  if (priority === 'chat' && speaking === 'turn' && window.speechSynthesis.speaking) {
+    deferred = { text, at: Date.now() }
+    return
+  }
+
   window.speechSynthesis.cancel()
   const utterance = new SpeechSynthesisUtterance(text)
   utterance.lang = 'en-US'
   if (preferredVoice) utterance.voice = preferredVoice
   utterance.rate = 1.0
   utterance.pitch = 1.0
+  utterance.onend = utterance.onerror = () => {
+    speaking = null
+    drainDeferred()
+  }
+  speaking = priority
   window.speechSynthesis.speak(utterance)
+}
+
+/**
+ * Unlock speech synthesis from inside a user gesture.
+ *
+ * iOS Safari refuses to speak until `speak()` has been called once from a real
+ * user interaction, and it fails silently — no error, no event, just nothing
+ * audible for the entire drive. Called from the Start-drive handler, which is
+ * the tap that begins every navigation session.
+ */
+export function primeSpeech(): void {
+  if (!isSpeechSynthesisSupported()) return
+  try {
+    window.speechSynthesis.resume()
+    const silent = new SpeechSynthesisUtterance('')
+    silent.volume = 0
+    window.speechSynthesis.speak(silent)
+  } catch {
+    // Priming is best-effort; a browser that dislikes it still speaks normally.
+  }
 }

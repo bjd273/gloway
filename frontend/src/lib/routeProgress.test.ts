@@ -3,7 +3,12 @@
 // anyone conflates the two.
 import { describe, expect, it } from 'vitest'
 
-import { bearingAtFraction, lengthFractions, metersBetween } from './routeProgress'
+import {
+  bearingAtFraction,
+  cumulativeMeters,
+  lengthFractions,
+  metersBetween,
+} from './routeProgress'
 
 /** Evenly spaced west→east, 11 points ~94m apart — the easy case where index
  * and distance happen to agree. */
@@ -54,6 +59,39 @@ describe('lengthFractions', () => {
       [-97.13, 32.72],
     ]
     expect(lengthFractions(stationary)).toEqual([0, 0])
+  })
+})
+
+describe('cumulativeMeters', () => {
+  it('is the scale lengthFractions divides away', () => {
+    // Turn guidance needs the metres themselves — "in 500 feet" can't be
+    // recovered from two fractions without this number tagging along.
+    const meters = cumulativeMeters(UNEVEN)
+    const fractions = lengthFractions(UNEVEN)
+    const total = meters[meters.length - 1]
+    expect(total).toBeGreaterThan(0)
+    for (let i = 0; i < UNEVEN.length; i += 1) {
+      expect(fractions[i]).toBeCloseTo(meters[i] / total, 9)
+    }
+  })
+
+  it('accumulates monotonically from zero', () => {
+    const meters = cumulativeMeters(EVEN)
+    expect(meters[0]).toBe(0)
+    for (let i = 1; i < meters.length; i += 1) {
+      expect(meters[i]).toBeGreaterThan(meters[i - 1])
+    }
+  })
+
+  it('returns zeros rather than NaN for degenerate routes', () => {
+    expect(cumulativeMeters([])).toEqual([])
+    expect(cumulativeMeters([[-97.13, 32.72]])).toEqual([0])
+    expect(
+      cumulativeMeters([
+        [-97.13, 32.72],
+        [-97.13, 32.72],
+      ]),
+    ).toEqual([0, 0])
   })
 })
 

@@ -66,11 +66,16 @@ function fitPadding(map: maplibregl.Map): maplibregl.PaddingOptions {
  * large TOP padding drops the puck into the lower part of the screen and
  * spends the rest on the road ahead — the whole reason to tilt the camera.
  * Centring the puck instead wastes half the screen on road already driven.
- * Bottom padding still tracks the sheet so the puck never hides under it.
+ * Bottom padding still tracks the sheet so the puck never hides under it, and
+ * the top adds the turn banner's measured height — without that the banner
+ * covers the road ahead, which is the part of the map the tilt exists for.
  */
 function navPadding(map: maplibregl.Map): maplibregl.PaddingOptions {
   const height = map.getContainer().clientHeight
-  const ahead = Math.round(height * 0.42)
+  const banner = useSheetStore.getState().bannerPx
+  // Clamped so a tall banner on a short viewport can't push top + bottom past
+  // the screen, which MapLibre resolves by ignoring the padding entirely.
+  const ahead = Math.min(Math.round(height * 0.42) + banner, Math.round(height * 0.6))
   if (window.matchMedia('(min-width: 768px)').matches) {
     return { top: ahead, bottom: 40, left: 390, right: 60 }
   }
@@ -592,7 +597,9 @@ export function MapView() {
       <div ref={containerRef} className="map-container" />
 
       {followSuspended && navPhase === 'navigating' && (
-        <button className="map-recenter" onClick={recenter}>
+        // Always modified, not conditionally: this pill only exists during a
+        // drive, which is exactly when the turn banner occupies the top strip.
+        <button className="map-recenter map-recenter--below-banner" onClick={recenter}>
           <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden>
             <path fill="currentColor" d={CROSSHAIR_PATH} />
           </svg>

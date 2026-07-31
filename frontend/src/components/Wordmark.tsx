@@ -1,7 +1,15 @@
 // The Gloway mark: the teal paper-plane / navigation star on a lime tile,
 // plus the lowercase wordmark. Same geometry as public/favicon.svg — keep the
 // two in sync when the logo changes.
+import { useTripStore } from '../stores/useTripStore'
+
 export function Wordmark() {
+  // Stands down during a drive. The turn banner claims the top of the screen
+  // and is wider than this, so leaving the wordmark up would put branding
+  // underneath the one thing on screen that has to be read at speed.
+  const navPhase = useTripStore((s) => s.navPhase)
+  if (navPhase === 'navigating') return null
+
   return (
     <div className="wordmark" aria-hidden>
       <svg width="20" height="20" viewBox="0 0 32 32" fill="none">

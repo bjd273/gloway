@@ -198,18 +198,133 @@ describe('DriveController real mode', () => {
   })
 })
 
+// ROUTE is 10 segments of ~94m — call it ~940m end to end.
+const ROUTE_METERS = 940
+
 describe('DriveController sim mode', () => {
   it('still walks the route on a timer and flushes batches (dev fallback)', async () => {
     const handlers = makeHandlers()
-    const controller = new DriveController('trip-7', ROUTE, handlers, 'sim', null)
+    // 100 m/s covers the ~940m fixture in ~9.4s of fake time.
+    const controller = new DriveController('trip-7', ROUTE, handlers, 'sim', null, {
+      metersPerSecond: 100,
+    })
     controller.start()
 
     await vi.advanceTimersByTimeAsync(3200) // 4 ticks @800ms + one 3s flush
     expect(handlers.onPosition).toHaveBeenCalled()
     expect(flushed.batches.length).toBeGreaterThan(0)
 
-    await vi.advanceTimersByTimeAsync(10_000) // sim finishes any route fast
+    await vi.advanceTimersByTimeAsync(10_000)
     expect(handlers.onArrive).toHaveBeenCalledTimes(1)
     controller.stop()
+  })
+
+  it('advances by real distance per tick, not by a fixed share of the route', async () => {
+    // The inversion this rewrite is for. The old sim covered any route in 45
+    // ticks, so each tick was a percentage — on a long route, a quarter mile at
+    // a time, and a countdown to the next turn jumped from "1200 feet" to "now"
+    // with nothing in between. Now a tick is a distance, and the ROUTE's length
+    // is what decides how long the drive takes.
+    const handlers = makeHandlers()
+    new DriveController('trip-9', ROUTE, handlers, 'sim', null, {
+      metersPerSecond: 100,
+    }).start()
+
+    await vi.advanceTimersByTimeAsync(800 * 5) // 5 ticks => ~400m driven
+    const progress = handlers.onProgress.mock.lastCall![0] as number
+    expect(progress * ROUTE_METERS).toBeCloseTo(400, -1)
+  })
+
+  it('scales with the speed multiplier without moving the finish line', async () => {
+    // Two ticks at 80m and 320m respectively — both short of the ~940m route,
+    // so this measures the multiplier rather than the clamp at the end.
+    const drive = (multiplier: number, trip: string) => {
+      const handlers = makeHandlers()
+      new DriveController(trip, ROUTE, handlers, 'sim', null, {
+        metersPerSecond: 100,
+        speedMultiplier: () => multiplier,
+      }).start()
+      return handlers
+    }
+
+    const slow = drive(1, 'trip-10a')
+    const fast = drive(4, 'trip-10b')
+    await vi.advanceTimersByTimeAsync(800 * 2)
+
+    const slowMeters = (slow.onProgress.mock.lastCall![0] as number) * ROUTE_METERS
+    const fastMeters = (fast.onProgress.mock.lastCall![0] as number) * ROUTE_METERS
+    expect(slowMeters).toBeCloseTo(160, -1)
+    expect(fastMeters / slowMeters).toBeCloseTo(4, 1)
+    // The multiplier speeds up the clock, it does not lengthen the road.
+    expect(fast.onProgress.mock.lastCall![0]).toBeLessThanOrEqual(1)
+  })
+
+  it('reads the multiplier every tick so it can change mid-drive', async () => {
+    const handlers = makeHandlers()
+    let multiplier = 1
+    new DriveController('trip-11', ROUTE, handlers, 'sim', null, {
+      metersPerSecond: 10,
+      speedMultiplier: () => multiplier,
+    }).start()
+
+    await vi.advanceTimersByTimeAsync(800) // 8m at 1x
+    const slow = handlers.onProgress.mock.lastCall![0] as number
+    multiplier = 8
+    await vi.advanceTimersByTimeAsync(800) // 64m at 8x
+    const fast = (handlers.onProgress.mock.lastCall![0] as number) - slow
+    expect(fast / slow).toBeCloseTo(8, 0)
+  })
+
+  it('interpolates between shape points instead of hopping along them', async () => {
+    // Without this the countdown would quantise to Valhalla's point spacing —
+    // 100m or more on a straight — and the puck would visibly jump.
+    const handlers = makeHandlers()
+    new DriveController('trip-12', ROUTE, handlers, 'sim', null, {
+      metersPerSecond: 20, // 16m per tick, well under the ~94m point spacing
+    }).start()
+
+    await vi.advanceTimersByTimeAsync(800)
+    const { lng, lat } = handlers.onPosition.mock.lastCall![0] as { lng: number; lat: number }
+    expect(lng).toBeGreaterThan(ROUTE[0][0])
+    expect(lng).toBeLessThan(ROUTE[1][0])
+    expect(lat).toBeCloseTo(32.72, 6)
+  })
+
+  it('uses the per-step speed profile so towns crawl and arterials open up', async () => {
+    const handlers = makeHandlers()
+    new DriveController('trip-13', ROUTE, handlers, 'sim', null, {
+      metersPerSecond: 5,
+      // A short slow stretch, then an arterial. 10 m/s covers the first band in
+      // two ticks, so the third is already running at the faster speed.
+      speedProfile: [
+        { endMeters: 10, metersPerSecond: 10 },
+        { endMeters: ROUTE_METERS, metersPerSecond: 200 },
+      ],
+    }).start()
+
+    await vi.advanceTimersByTimeAsync(800) // 10 m/s * 0.8s
+    const slow = (handlers.onProgress.mock.lastCall![0] as number) * ROUTE_METERS
+    expect(slow).toBeCloseTo(8, 0)
+
+    await vi.advanceTimersByTimeAsync(800 * 2) // past 10m, so now 200 m/s
+    const fast = (handlers.onProgress.mock.lastCall![0] as number) * ROUTE_METERS
+    expect(fast - slow).toBeGreaterThan(100)
+  })
+
+  it('arrives once the driven distance reaches the route length, tail flushed first', async () => {
+    const handlers = makeHandlers()
+    new DriveController('trip-14', ROUTE, handlers, 'sim', null, {
+      metersPerSecond: 100,
+    }).start()
+
+    await vi.advanceTimersByTimeAsync(800 * 5) // ~400m — not there yet
+    expect(handlers.onArrive).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(800 * 10) // past 940m
+    expect(handlers.onArrive).toHaveBeenCalledTimes(1)
+    // Same ordering guarantee as real mode: the trace lands before /complete
+    // scores adherence against it.
+    expect(flushed.batches.flat().length).toBeGreaterThan(0)
+    expect(handlers.onProgress.mock.lastCall![0]).toBe(1)
   })
 })

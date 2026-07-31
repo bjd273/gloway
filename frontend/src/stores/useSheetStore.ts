@@ -1,8 +1,9 @@
-// How tall the bottom sheet currently is, and how tall it wants to be.
+// How tall the floating chrome currently is: the bottom sheet, and the turn
+// banner that appears over the map while driving.
 //
 // This is a store rather than component state because MapView is a *sibling* of
-// the sheet, not a descendant, and it needs the live height to keep the route
-// clear of the sheet when fitting bounds.
+// both, not a descendant, and it needs their live heights to keep the route
+// clear of them when fitting bounds and when following the driver.
 import { create } from 'zustand'
 
 export type Snap = 'peek' | 'half' | 'full'
@@ -24,15 +25,23 @@ interface SheetState {
    * in and out while driving, so that mapping shifts underneath you.
    */
   heightPx: number
+  /**
+   * Measured height of the turn banner, 0 when it isn't showing. Same reason
+   * it's measured: the card grows and shrinks with the "then" row and the lane
+   * strip, and a constant would either waste space or let it cover the road.
+   */
+  bannerPx: number
   setSnap(snap: Snap): void
   /** Advance peek → half → full → peek. The tap-the-grabber path. */
   cycleSnap(): void
   setHeightPx(px: number): void
+  setBannerPx(px: number): void
 }
 
 export const useSheetStore = create<SheetState>((set, get) => ({
   snap: 'half',
   heightPx: 0,
+  bannerPx: 0,
 
   setSnap(snap) {
     if (get().snap !== snap) set({ snap })
@@ -47,6 +56,10 @@ export const useSheetStore = create<SheetState>((set, get) => ({
     // Sub-pixel churn from the ResizeObserver would re-render MapView on every
     // frame of the height transition.
     if (Math.abs(get().heightPx - px) >= 1) set({ heightPx: px })
+  },
+
+  setBannerPx(px) {
+    if (Math.abs(get().bannerPx - px) >= 1) set({ bannerPx: px })
   },
 }))
 
