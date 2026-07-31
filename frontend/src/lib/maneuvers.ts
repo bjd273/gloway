@@ -82,14 +82,15 @@ export class ManeuverTracker {
    * update walks straight past it onto the first real turn — which is what a
    * driver wants to see the moment they pull away.
    *
-   * The step index only ever moves FORWARD. It has to: DriveController projects
-   * each GPS fix onto the nearest route coordinate by scanning the whole line,
-   * so on a loop-shaped route — or either side of a U-turn, where two opposite
-   * stretches of road sit metres apart — one noisy fix can land on a coordinate
-   * the driver passed ten minutes ago. Allowing that to rewind the step would
-   * re-announce a turn already taken and flip the banner back to an instruction
-   * the driver has finished obeying, which are the two worst things a turn
-   * banner can do.
+   * The step index only ever moves FORWARD. This began as defence against
+   * DriveController's whole-line nearest-point scan, which on a loop-shaped
+   * route — or either side of a U-turn, where two opposite stretches of road sit
+   * metres apart — could land a noisy fix on a coordinate the driver passed ten
+   * minutes ago. The projection is windowed now, so that is much rarer, but the
+   * guard stays: the window still falls back to a full scan when it loses the
+   * driver, and the failure it prevents is one of the two worst things a turn
+   * banner can do — re-announcing a turn already taken, or flipping back to an
+   * instruction the driver has finished obeying.
    *
    * The distance readout is only floored at the previous maneuver, not held at
    * a high-water mark: within a step the honest projection wins, so drifting or

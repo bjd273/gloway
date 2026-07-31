@@ -1644,6 +1644,22 @@ body[data-prefs-open] .gw-bubble {
   color: var(--text-muted);
 }
 
+/* Signal-lost notice. Sits above the instruction rather than replacing any of
+   it: the turn ahead is still the thing the driver needs, and this only
+   explains why the puck has stopped. Muted, not alarming — a tunnel is normal. */
+.turn-banner-signal {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 8px;
+  padding: 5px 9px;
+  border-radius: 8px;
+  background: var(--surface-sunken, rgba(127, 127, 127, 0.12));
+  color: var(--text-muted);
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
 .turn-banner-mute {
   flex: none;
   margin-left: auto;

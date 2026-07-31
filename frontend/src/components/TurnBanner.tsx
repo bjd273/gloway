@@ -112,6 +112,7 @@ export function TurnBanner() {
   const navPhase = useTripStore((s) => s.navPhase)
   const guidance = useTripStore((s) => s.guidance)
   const routes = useTripStore((s) => s.routes)
+  const gpsSignalLost = useTripStore((s) => s.gpsSignalLost)
   const selectedIndex = useTripStore((s) => s.selectedIndex)
   const voiceGuidance = useVoiceStore((s) => s.voiceGuidance)
   const setVoiceGuidance = useVoiceStore((s) => s.setVoiceGuidance)
@@ -167,6 +168,16 @@ export function TurnBanner() {
       <p className="gw-sr-only" aria-live="polite">
         {step.text}
       </p>
+
+      {/* Says why the puck has stopped moving. Without it a tunnel looks
+          identical to the app being broken — and it used to BE broken: any
+          watchPosition error ended the drive, so a twenty-second tunnel killed
+          the trip. The drive is still live here; the position is just stale. */}
+      {gpsSignalLost && (
+        <p className="turn-banner-signal" role="status">
+          <span aria-hidden>📡</span> Waiting for GPS — your position is paused
+        </p>
+      )}
 
       <div className="turn-banner-main">
         <ManeuverIcon className="turn-banner-icon" type={step.type} size={40} />

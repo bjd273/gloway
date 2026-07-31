@@ -176,9 +176,18 @@ cumulative metres:
 - `lengthFractions(coords)` — cumulative length fraction per coordinate, index-parallel so a
   nearest-point search converts in O(1). Degenerate routes return zeros, never `NaN` — a `NaN`
   reaching `line-progress` blanks the route silently.
-- `bearingAtFraction(...)` — compass bearing from the route's **geometry**, looking ~60 m ahead,
-  not from consecutive GPS fixes. A fix-delta bearing spins randomly at a standstill and a map
-  that spins at every red light is unusable.
+- `bearingAtFraction(...)` — compass bearing from the route's **geometry**, looking ahead a
+  speed-scaled distance (three seconds of road, clamped to 40–120 m). This is what the **camera**
+  faces, and where the anticipatory rotation into a turn comes from. It is not read from
+  consecutive GPS fixes: a fix-delta bearing spins randomly at a standstill and a map that spins at
+  every red light is unusable. The **puck's arrow** is a different question and uses the fix's own
+  course over ground, which stays correct off-route where the route bearing does not — see
+  `snapToRoute.ts` and the heading split in `MapView`.
+- `snapToRoute.ts` — perpendicular projection of a fix onto the route, plus the confidence gate
+  that decides how much of the puck's drawn position comes from the road rather than the raw fix.
+  Only the display position is snapped; raw fixes still go to the backend.
+- `smoothing.ts` / `driveCamera.ts` — frame-rate-independent easing and the drive camera's
+  animation loop. See the ADRs before changing either.
 
 ## Turn-by-turn guidance
 
@@ -269,8 +278,17 @@ below 15.5 (hysteresis prevents flapping), and any user pitch gesture disables t
 **Driving** — `NAV_ZOOM 16.8`, `NAV_PITCH 55`, bearing tracking the route so "ahead" is up, and a
 padding that weights the **top** so the puck sits low and the screen is spent on road ahead. The
 zoom-band automation is suppressed while driving, or the two would fight over pitch. Touching the
-map releases follow and raises a "Re-center" pill; the guard is `originalEvent`, so the app's own
-`easeTo` can't trip it.
+map releases follow and raises a "Re-center" pill; the guard is `originalEvent`, so neither the
+app's own `easeTo` nor the camera loop's `jumpTo` can trip it.
+
+Driving is not an `easeTo` per fix — it is a `requestAnimationFrame` loop in
+[`lib/driveCamera.ts`](../frontend/src/lib/driveCamera.ts) that interpolates toward a target the
+position effect updates. **While that loop runs it owns the camera**: `jumpTo` calls `stop()`
+internally, so any concurrent `easeTo`/`fitBounds` is cancelled on the next frame. The drive-end
+unwind stops the loop before its `fitBounds`; `recenter()` pauses it around its ease; the
+sheet-padding nudge goes through `setPadding()` instead. `jumpTo` also fires `moveend` every frame,
+which is why the `moveend` → `setMapCenter` handler is guarded by `navigatingRef`. See
+[Decisions](decisions.md#the-driving-camera-is-one-continuous-loop-and-owns-the-map-while-it-runs).
 
 ## Route naming
 
@@ -297,7 +315,10 @@ logic actually lives:
 
 | File | Covers |
 |---|---|
-| `navigation.test.ts` | `DriveController` — fix throttling, nearest-point progress, arrival ordering, the tail flush, permission denial. Injects a fake Geolocation and mocks the API. |
+| `navigation.test.ts` | `DriveController` — batch-vs-display throttling, projected progress, arrival ordering, the tail flush, fix-quality rejection, the heading latch, snapping and release, permission denial vs transient signal loss. Injects a fake Geolocation and mocks the API. Its fixes move at plausible car speeds, because the teleport rejection correctly discards anything faster. |
+| `snapToRoute.test.ts` | Perpendicular projection, the windowed search and its full-scan rescue, and the confidence gate (including the opposite-carriageway case). |
+| `smoothing.test.ts` | Shortest-arc bearing arithmetic and frame-rate independence — the property the exponential form exists for. |
+| `driveCamera.test.ts` | The camera loop against a fake map and a hand-cranked frame clock: pause/stop, settle-and-sleep, dead-reckoning cap, reduced motion. |
 | `routeProgress.test.ts` | Length-vs-index progress, degenerate routes, bearing orientation and lookahead smoothing. |
 | `routeSummary.test.ts` | Formatting, route naming and de-duplication, road abbreviation. |
 | `api.test.ts` | `dominantStreet` — distance weighting, first/last exclusion. |

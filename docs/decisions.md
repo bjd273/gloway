@@ -261,7 +261,7 @@ The first implementation built the countdown targets from `end`. That is the cor
 
 **Status:** Adopted (July 2026).
 
-**Context:** `DriveController` finds each GPS fix's nearest route coordinate by scanning the entire line. On a loop-shaped route, or on either side of a U-turn where two opposite stretches of road sit metres apart, one noisy fix can project onto a coordinate the driver passed ten minutes ago.
+**Context:** `DriveController` originally found each GPS fix's nearest route *coordinate* by scanning the entire line. On a loop-shaped route, or on either side of a U-turn where two opposite stretches of road sit metres apart, one noisy fix can project onto a coordinate the driver passed ten minutes ago. (The projection is windowed now — see the snap-to-route entry below — which makes this much rarer without making it impossible: the window still falls back to a full scan when it loses the driver.)
 
 **Decision:** `ManeuverTracker` holds its step index against any backwards movement. The distance readout is floored at the previous maneuver but not held at a high-water mark.
 
@@ -292,3 +292,65 @@ The first implementation built the countdown targets from `end`. That is the cor
 **Consequences:** A drive that begins inside the warning distance stays quiet until the turn itself, and a reroute that lands the driver mid-route announces nothing for the steps it skipped — a fresh announcer has seen no crossings. Checking the near threshold first matters when one update jumps past both, which an 8× sim tick or a GPS gap under an overpass will do: the urgent line is the one worth saying, and marking the warning spent stops it arriving after the turn it was warning about. Priority defaults to `'chat'`, so the three existing call sites behave exactly as before.
 
 `voiceGuidance` is a separate preference from `autoSpeak` in both storage and default — `autoSpeak` reads the assistant aloud and starts off, `voiceGuidance` speaks turns and starts on. Because the key was added to an existing persisted blob, it is read as `parsed.voiceGuidance !== false` rather than `Boolean(...)`: absent means "never chose", and reading it as false would have shipped the feature muted to exactly the people who had used the app before.
+
+---
+
+## The places extract is checked against the region it claims to cover
+
+**Status:** Adopted (July 2026), after the failure below.
+
+**Context:** `data/region.json` was widened from a 5.6 × 4.9 km box to all of Arlington, and every derived artifact was rebuilt except `data/overture/places.parquet`, which kept covering the old box for eleven days. Nothing anywhere reported a problem: the file existed, the duckdb queries ran, they simply found nothing across 94% of the area the basemap was drawing labels for. Measured after the fact, 81% of the region's labelled POIs were not in the search index at all. The Overture download was also the one step of `rebuild_region.sh` that needed a tool (`uv`/`uvx`) the rest of the pipeline did not, which is how it came to be skipped.
+
+**Decision:** `mapdata/places_coverage.check_coverage()` compares the bbox recorded in `places.parquet.state` against `region.json`, and both ends call it: `data/download_overture.sh` fails the build, and `OvertureMapDataSource.__init__` logs a warning at startup. The download itself moved to duckdb + httpfs against Overture's public S3, so it needs nothing that the query path did not already need.
+
+**Consequences:** A short extract is now loud at build time and at boot instead of silent forever. The check is deliberately on the *recorded* bbox rather than on the data, so a region with genuinely no places near one edge doesn't fail. The runtime check warns rather than raising: an extract short on one side is still far better than no search at all, and taking the service down over it would be a worse failure than the one being prevented.
+
+**Revisit if:** more than one extract needs this, in which case the state-file convention is worth formalising rather than repeating.
+
+---
+
+## Destination search indexes OSM as well as Overture
+
+**Status:** Adopted (July 2026).
+
+**Context:** The map's POI labels are built by Planetiler from `region.osm.pbf`; search queried an Overture extract. Two providers, two vocabularies, two id spaces, and no crosswalk between them — so "labelled on the map" and "findable by name" were only ever coincidentally the same set, and a driver hit the gap. Overture is genuinely the larger corpus (~22k places against ~3.8k named OSM POIs for the same region), so replacing one with the other was not the answer either.
+
+**Decision:** `HybridMapDataSource` takes a *list* of places sources — `[OvertureMapDataSource, OsmPlacesSource]` — and unions them with Nominatim. `OsmPlacesSource` reads `data/osm/places.parquet`, built by `data/build_osm_places.sh` from the same `region.osm.pbf` the labels come from. Results are scored by one shared ranker (`mapdata/ranking.py`) *after* the merge and truncated afterwards.
+
+**Consequences:** Anything the basemap can label is findable by name by construction, not by luck, while Overture still supplies the volume. Ranking had to move after the merge: the previous "Overture first, Nominatim appended, cut to five" let five weak substring matches discard an exact match another source had found before anything compared them. Dedupe needed two rules rather than one — a 50 m radius for same-ish names, and a ~1 km radius for *identical* names, because a large site is a polygon in one source and a point in the other and their centroids can sit far apart (this is why "Six Flags Over Texas" came back twice). Ranking also needed a specificity term, or every tenant whose name contains "Parks Mall" ties with the mall itself.
+
+**Revisit if:** a third places provider arrives, or the two indexes drift far enough apart that an id crosswalk is worth building instead of a name-and-distance dedupe.
+
+---
+
+## The driving camera is one continuous loop, and owns the map while it runs
+
+**Status:** Adopted (July 2026), replacing a per-fix `easeTo`.
+
+**Context:** The camera fired a single `easeTo({duration: 650})` per position update, and updates arrive roughly once a second. It therefore moved for 650 ms and then sat still for ~350 ms, repeatedly. The 650 ms was chosen deliberately, to stop eases overlapping — the original comment's reasoning ("overlapping eases read as the camera drifting rather than tracking") was correct, and the dead gap it produced is what a driver described as the rotation into a turn being good but not smooth.
+
+**Decision:** `lib/driveCamera.ts` runs a `requestAnimationFrame` loop holding a target (updated per fix) and a current state, interpolating between them each frame with a first-order lag from `lib/smoothing.ts`.
+
+**The constraint that is invisible from the call site:** maplibre-gl 5's `Camera.jumpTo` begins with `this.stop()`. A per-frame `jumpTo` therefore cancels any animation in flight, so **while the loop runs nothing else may call `easeTo`/`flyTo`/`fitBounds`/`jumpTo` on the map**. The drive-end unwind calls `driveCamera.stop()` *before* its `fitBounds` for exactly this reason, and `recenter()` pauses the loop for the duration of its ease. Anyone adding an `easeTo` back to a drive-time path will find it silently cancelled a frame later.
+
+`jumpTo` also fires `movestart`/`move`/`moveend` on every call — measured at 360 events in 6 seconds — so `moveend` → `setMapCenter` is guarded by `navigatingRef`, or a drive would push 60 store writes a second.
+
+**Consequences:** A first-order lag rather than a spring, because a spring overshoots and overshoot on a bearing is the "drifting rather than tracking" failure again; and because `1 - exp(-dt/tau)` is exactly frame-rate independent, which is a property a test can assert and the thing a later simplification to a fixed per-frame factor would break. Bearings interpolate on the short arc, or a driver crossing north sends the camera 358° the wrong way mid-turn. The loop settles and then sleeps, since a phone in a hot windscreen mount for 25 minutes is a real constraint. Owning every frame also makes dead reckoning possible: the target advances along the *route* (not the heading vector, which would fling the puck off every bend) capped at 1.5 s, so the puck freezes in a tunnel rather than confidently driving down a road the car may have left.
+
+**Revisit if:** MapLibre gains a first-class "follow this position" camera mode, which would make most of this file redundant.
+
+---
+
+## Snap-to-route is display-only, and gated on confidence
+
+**Status:** Adopted (July 2026).
+
+**Context:** The puck was drawn at the raw GPS fix. In an outer lane of a six-lane arterial that is 10–15 m off the route's centreline, and a driver reported it as looking like the app thought they were making a mistake. There was no map matching anywhere in the codebase.
+
+**Decision:** Each fix is projected perpendicularly onto the route (`lib/snapToRoute.ts`) and the puck is drawn on the line, blended toward the raw fix by a confidence weight. The weight combines distance — against a corridor that widens with the fix's own reported accuracy — with heading agreement between the fix's course and the road's direction, both smoothstepped, and is then smoothed over ~0.7 s so nothing pops.
+
+**Only the display position is snapped.** `DriveController` keeps pushing raw coordinates to `/gps-update`, because `services/signal_processor.py` scores route adherence off that trace: posting snapped points would make `adherence_rate` 1.0 by construction and quietly poison the reward signal the whole learning loop depends on. The sim honours the same rule — under `?jitter=` it displays the scattered position and buffers the true one.
+
+**Consequences:** The heading term is *directed*, not folded to ±90°, so the opposite carriageway of a divided road scores ~180° and correctly refuses to snap; folding would have stuck the puck on the wrong roadway, which is worse than not snapping. Confidence collapsing on a genuine wrong turn is what keeps the screen honest — it releases within about two seconds rather than lying until re-routing notices. Progress now comes from the projection too, replacing a nearest-shape-point scan that quantised to Valhalla's spacing (100 m+ on a straight) and took the turn countdown with it. The search is windowed around the last position, which is what stops a route that doubles back from matching a leg driven ten minutes ago, but the first fix of a drive still scans the whole line because a reroute restart can resume anywhere.
+
+**Revisit if:** the app needs to know which *lane* the driver is in, or starts routing on roads dense enough that a 1 km-scale windowed search picks the wrong parallel road — either would mean reaching for Valhalla's `trace_attributes` map matching instead.

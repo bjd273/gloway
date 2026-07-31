@@ -475,7 +475,7 @@ export const useTripStore = create<TripState>((set, get) => {
       driveController.start()
       // Note on reroutes: in real mode a post-reroute restart naturally
       // resumes from the live GPS fix (the device is the source of truth) and
-      // the first fix's nearest-point projection lands navProgress mid-route
+      // the first fix's projection lands navProgress mid-route
       // correctly. Only the sim replays from the route's start.
     },
 

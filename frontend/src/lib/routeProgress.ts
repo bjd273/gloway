@@ -4,7 +4,7 @@
 // answer in the same units or the lit half of the ribbon won't line up with
 // the puck sitting on it:
 //
-//   - DriveController projects each GPS fix onto the nearest route coordinate.
+//   - DriveController projects each GPS fix perpendicularly onto the route.
 //   - MapLibre's `line-progress` addresses a line by fraction of its LENGTH.
 //   - TripSheet / NavVoice multiply the fraction by the route's total miles.
 //
@@ -34,7 +34,7 @@ export function metersBetween(a: [number, number], b: [number, number]): number 
  *
  * `fractions[i]` is how far along the line coordinate `i` sits — exactly the
  * number `line-progress` expects. The array is always the same length as
- * `coords`, so an index from a nearest-point search indexes straight into it.
+ * `coords`, so a segment index from a projection indexes straight into it.
  * A degenerate route (under 2 points, or every point identical) comes back all
  * zeros rather than NaN, so callers never have to guard the divide.
  */
@@ -55,8 +55,8 @@ export function lengthFractions(coords: [number, number][]): number[] {
  * recovered from two fractions without the route's total length tagging along,
  * and passing that around separately is how the two get out of step.
  *
- * Index-parallel to `coords`, always, so a nearest-point index reads straight
- * in. A degenerate route comes back all zeros rather than NaN.
+ * Index-parallel to `coords`, always, so a projection's segment index reads
+ * straight in. A degenerate route comes back all zeros rather than NaN.
  */
 export function cumulativeMeters(coords: [number, number][]): number[] {
   const meters = new Array<number>(coords.length).fill(0)

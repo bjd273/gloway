@@ -61,15 +61,18 @@ classDiagram
     }
     class OSMMapDataSource
     class OvertureMapDataSource
+    class OsmPlacesSource
     class HybridMapDataSource {
         -routing_source
-        -places_source
+        -places_sources
     }
     MapDataSource <|.. OSMMapDataSource
     MapDataSource <|.. OvertureMapDataSource
+    MapDataSource <|.. OsmPlacesSource
     MapDataSource <|.. HybridMapDataSource
     HybridMapDataSource --> OSMMapDataSource : routing + addresses
-    HybridMapDataSource --> OvertureMapDataSource : places
+    HybridMapDataSource --> OvertureMapDataSource : places (volume)
+    HybridMapDataSource --> OsmPlacesSource : places (same source as map labels)
 
     class LLMClient {
         <<ABC>>
@@ -153,7 +156,9 @@ sheet, one column of chrome down the left with the map to its right.
 
 `lib/api.ts` is the only module that calls `fetch`/opens the WebSocket; every user-facing error string lives there (`FriendlyError`), so components and stores never format raw HTTP details for display.
 
-`lib/navigation.ts`'s `DriveController` is the live position source, with two interchangeable modes behind one pipeline: `real` uses `navigator.geolocation.watchPosition`, and `sim` (selected with `?sim=1`, or automatically when the Geolocation API is missing) advances along the route in metres per second at the route's own pace, with a 1×/4×/8× multiplier. Everything downstream — buffering, batched flushes to `/trips/{id}/gps-update`, the puck, the camera, turn guidance, arrival — is identical in both, which is what makes sim an honest stand-in outside the Arlington tile region.
+`lib/navigation.ts`'s `DriveController` is the live position source, with two interchangeable modes behind one pipeline: `real` uses `navigator.geolocation.watchPosition`, and `sim` (selected with `?sim=1`, or automatically when the Geolocation API is missing) advances along the route in metres per second at the route's own pace, with a 1×/4×/8× multiplier. Everything downstream — buffering, batched flushes to `/trips/{id}/gps-update`, the puck, the camera, turn guidance, arrival — is identical in both, which is what makes sim an honest stand-in outside the Arlington tile region. That equivalence now has to be actively maintained rather than assumed: a position update carries course, speed, accuracy and snap confidence, and sim fills all of them with real values instead of blanks. `?sim=1&jitter=8` additionally scatters the emitted position so the snapping path can be exercised on a laptop.
+
+It emits two positions per update, and the distinction matters: the **display** position is snapped to the route, while the position buffered for `/gps-update` is always the raw fix. `services/signal_processor.py` scores route adherence off that trace, so sending snapped points would make `adherence_rate` 1.0 by construction — see [ADR: snap-to-route is display-only](decisions.md#snap-to-route-is-display-only-and-gated-on-confidence).
 
 The progress fraction it emits is a fraction of route **length**, computed in `lib/routeProgress.ts`, not of coordinate count. Valhalla packs shape points tightly through curves and spreads them on straights, so the two diverge badly, and the map's `line-progress` gradients address the line by length — see [ADR: distance-based progress](decisions.md#progress-is-a-fraction-of-length-not-of-coordinate-count).
 

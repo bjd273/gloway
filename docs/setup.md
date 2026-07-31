@@ -12,12 +12,12 @@ and what to do when something breaks.
 | Python 3.11+ | backend (`requires-python = ">=3.11,<4.0"`) | |
 | Poetry | backend dependencies | `pipx install poetry` |
 | Node 20+ | frontend | |
-| `osmium-tool` | cropping the OSM extract to the region bbox | `brew install osmium-tool` |
-| `uv` (optional) | Overture places download, via `uvx` | `brew install uv` |
+| `osmium-tool` | cropping the OSM extract to the region bbox, and building the POI search index | `brew install osmium-tool` |
 
 Planetiler builds the basemap inside a container (`ghcr.io/onthegomap/planetiler`), so no local
-Java is required. Without `uv`, `rebuild_region.sh` skips the Overture step and says so — place
-search still works, it just falls back to Nominatim/OSM with fewer name matches.
+Java is required. The Overture download needs only network access to their public S3 bucket — it
+goes through duckdb, which the backend already depends on. If it fails, `rebuild_region.sh` says
+so and continues; place search still works, falling back to the OSM POI index and Nominatim.
 
 ## Configuration
 
@@ -98,12 +98,18 @@ re-run, and everything except the Overture download works offline once the cache
 | 1. OSM extract | `data/download_osm.sh` downloads the Texas extract if absent, then `osmium extract` crops it to the bbox | ~700 MB download, then seconds |
 | 2. Valhalla tiles | Copies the crop into `valhalla/custom_files/`, clears the cached tar, restarts Valhalla with `VALHALLA_USE_CACHED_TILES=False` to force a rebuild, waits for `"Starting valhalla service"` in the logs, then restarts with caching back on | the slow one — minutes |
 | 3. Basemap | Planetiler (Docker) → `data/tiles/region.pmtiles`, then restarts Martin | ~1.3 GB of sources cached on first run |
-| 4. Overture places | `data/download_overture.sh` via `uvx`. **Non-fatal** — a failure here warns and continues, deliberately, so step 5 still runs | minutes |
-| 5. Frontend sync | Copies `data/region.json` → `frontend/src/lib/region.json` | instant |
+| 4. Overture places | `data/download_overture.sh` (duckdb + httpfs against Overture's S3). **Non-fatal** — a failure here warns and continues, deliberately, so later steps still run. Verifies the extract covers `region.json` before declaring success | minutes |
+| 5. OSM POI index | `data/build_osm_places.sh` — osmium over the same `region.osm.pbf` the basemap labels come from, so anything labelled is searchable | seconds |
+| 6. Frontend sync | Copies `data/region.json` → `frontend/src/lib/region.json` | instant |
 
-Step 4 is allowed to fail on purpose. Places only enrich destination search; routing and the
-basemap don't need them. Failing hard would skip step 5 and leave the frontend's coverage gate
+Steps 4 and 5 are allowed to fail on purpose. Places only enrich destination search; routing and
+the basemap don't need them. Failing hard would skip step 6 and leave the frontend's coverage gate
 disagreeing with the tiles just built — a much worse outcome than thinner POI search.
+
+Step 4 does fail the build if the extract it downloaded doesn't cover `region.json`. That is the
+one case worth stopping for: an extract quietly narrower than the region is invisible at runtime —
+every query succeeds and simply finds nothing outside the old box — and it has happened. See
+[Decisions](decisions.md#the-places-extract-is-checked-against-the-region-it-claims-to-cover).
 
 Restart the frontend dev server afterwards so Vite picks up the new `region.json`.
 
