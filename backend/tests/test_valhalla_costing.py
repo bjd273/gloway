@@ -105,6 +105,26 @@ async def test_auto_mode_includes_costing_options():
     assert "auto" in client.last_payload["costing_options"]
 
 
+async def test_native_format_is_the_default():
+    """No `format` key unless one is asked for.
+
+    `trips.suggested_route` is persisted in the native shape and read back by
+    signal_processor and train_route_scorer, so a default that ever became
+    "osrm" would quietly break the reward pipeline.
+    """
+    client = _CapturingClient()
+    router = ValhallaRouter("http://unused", client=client)
+    await router.get_route((32.72, -97.13), (32.75, -97.09))
+    assert "format" not in client.last_payload
+
+
+async def test_osrm_format_is_opt_in():
+    client = _CapturingClient()
+    router = ValhallaRouter("http://unused", client=client)
+    await router.get_route((32.72, -97.13), (32.75, -97.09), response_format="osrm")
+    assert client.last_payload["format"] == "osrm"
+
+
 def _valhalla_reachable() -> bool:
     parsed = urlparse(settings.valhalla_url)
     host, port = parsed.hostname or "localhost", parsed.port or 8002

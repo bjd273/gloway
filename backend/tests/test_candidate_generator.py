@@ -63,16 +63,28 @@ SOUTH = _line(-97.14, 32.745, -97.08, 32.745)
 
 
 class StubRouter:
-    """Returns a canned response per strategy, or raises for named failures."""
+    """Returns a canned response per strategy, or raises for named failures.
+
+    Every strategy fires twice — once natively and once in OSRM shape to
+    harvest turn lanes (see routing/lane_guidance.py). `calls` counts only the
+    native ones, so the assertions below stay about strategies rather than
+    about how many dialects we happen to ask in; `osrm_calls` covers the rest.
+    """
 
     def __init__(self, responses, fail_for=()):
         self._responses = responses
         self._fail_for = set(fail_for)
         self.calls: list[dict | None] = []
+        self.osrm_calls: list[dict | None] = []
 
-    async def get_route(self, *, costing_overrides=None, **kwargs):
-        self.calls.append(costing_overrides)
+    async def get_route(self, *, costing_overrides=None, response_format=None, **kwargs):
         key = tuple(sorted((costing_overrides or {}).items()))
+        if response_format == "osrm":
+            self.osrm_calls.append(costing_overrides)
+            # The lane merge drops anything that doesn't pair cleanly, so a stub
+            # that returned nothing usable is the "no lanes today" path.
+            return {"routes": []}
+        self.calls.append(costing_overrides)
         if key in self._fail_for:
             raise RuntimeError("valhalla said no")
         return self._responses.get(key, self._responses.get("default"))
@@ -118,6 +130,9 @@ async def test_sweep_runs_every_strategy_and_pools_results():
     cands = await generate_candidates(router, (32.79, -97.12), (32.70, -97.12))
     # One call per auto strategy...
     assert len(router.calls) == len(strategies_for("auto"))
+    # ...each shadowed by an OSRM call carrying the same costing, so lane
+    # guidance describes the route we actually return rather than some other one.
+    assert router.osrm_calls == router.calls
     # ...and the baseline goes out with no overrides, so the user's own
     # preferences are still represented in the pool.
     assert router.calls[0] is None
@@ -141,6 +156,27 @@ async def test_all_strategies_failing_raises_so_the_caller_can_surface_it():
 
     with pytest.raises(RuntimeError):
         await generate_candidates(Dead(), (32.79, -97.12), (32.70, -97.12))
+
+
+@pytest.mark.asyncio
+async def test_lane_lookup_failing_does_not_cost_the_user_their_route():
+    """Lane guidance is a nicety bolted onto the routing hot path.
+
+    It fires a second Valhalla call per strategy purely to read turn lanes. If
+    that call errors the driver should lose a lane strip, not a route — so the
+    failure is swallowed and the native response is returned untouched.
+    """
+
+    class OsrmIsDown(StubRouter):
+        async def get_route(self, *, response_format=None, **kwargs):
+            if response_format == "osrm":
+                raise RuntimeError("osrm endpoint unhappy")
+            return await super().get_route(**kwargs)
+
+    router = OsrmIsDown({"default": _response(NORTH)})
+    cands = await generate_candidates(router, (32.79, -97.12), (32.70, -97.12))
+    assert cands
+    assert all("lanes" not in m for c in cands for leg in c.trip["legs"] for m in leg.get("maneuvers", []))
 
 
 @pytest.mark.asyncio
