@@ -11,7 +11,13 @@ import { FriendlyError, getRoute, type ParsedRoute, type TravelMode } from '../l
 import { resolveOrigin } from '../lib/geolocate'
 import { ManeuverTracker, type ManeuverProgress, stepBoundaries } from '../lib/maneuvers'
 import { TurnAnnouncer } from '../lib/navAnnounce'
-import { DriveController, type DriveMode, resolveDriveMode } from '../lib/navigation'
+import {
+  DriveController,
+  type DriveMode,
+  type DrivePosition,
+  resolveDriveMode,
+  resolveSimJitter,
+} from '../lib/navigation'
 import { cumulativeMeters } from '../lib/routeProgress'
 import { primeSpeech, speak } from '../lib/voice'
 import { useUserStore } from './useUserStore'
@@ -155,6 +161,19 @@ interface TripState {
   navPhase: NavPhase
   /** Live position during navigation (the moving puck). */
   currentPosition: Place | null
+  /**
+   * The full detail behind `currentPosition`: raw vs snapped coordinates,
+   * course over ground, speed, accuracy, snap confidence.
+   *
+   * A sibling field rather than fatter `Place` because `Place` is also an
+   * origin, a destination and a saved home — none of which have a heading.
+   * Written in the same `set()` as `currentPosition`, so the two can never
+   * describe different moments.
+   */
+  navFix: DrivePosition | null
+  /** Real mode: fixes have stopped arriving (tunnel, garage). The drive is
+   * still live — the puck just freezes until the signal comes back. */
+  gpsSignalLost: boolean
   /** Fraction 0..1 driven along the selected route. */
   navProgress: number
   /**
@@ -267,6 +286,8 @@ export const useTripStore = create<TripState>((set, get) => {
     driveMode: initialDriveMode(),
     navPhase: 'idle',
     currentPosition: null,
+    navFix: null,
+    gpsSignalLost: false,
     navProgress: 0,
     guidance: null,
     simSpeed: initialSimSpeed(),
@@ -391,6 +412,8 @@ export const useTripStore = create<TripState>((set, get) => {
       set({
         navPhase: 'navigating',
         navProgress: 0,
+        navFix: null,
+        gpsSignalLost: false,
         guidance: null,
         arrived: false,
         currentPosition: origin,
@@ -399,7 +422,12 @@ export const useTripStore = create<TripState>((set, get) => {
         tripId,
         coords,
         {
-          onPosition: (p) => set({ currentPosition: { lng: p.lng, lat: p.lat, label: 'You' } }),
+          // Both written in one set(): `currentPosition` stays the simple
+          // {lng,lat} compatibility surface everything already reads, and
+          // `navFix` carries what the camera and the puck arrow need. Writing
+          // them together is what stops the two describing different moments.
+          onPosition: (p) =>
+            set({ currentPosition: { lng: p.lng, lat: p.lat, label: 'You' }, navFix: p }),
           onProgress: (fraction) => {
             // No separate handler for guidance: `fraction * routeMeters` IS the
             // distance driven, in both modes, by construction. A parallel
@@ -423,10 +451,15 @@ export const useTripStore = create<TripState>((set, get) => {
             set({
               navPhase: 'idle',
               currentPosition: null,
+              navFix: null,
               navProgress: 0,
               errorMessage: message,
             })
           },
+          // A tunnel or a parking garage, not a dead drive. The puck freezes
+          // where it was and the banner says so; the watch keeps retrying and
+          // this flips back on the next good fix.
+          onGpsSignal: (lost) => set({ gpsSignalLost: lost }),
         },
         get().driveMode,
         undefined,
@@ -436,6 +469,7 @@ export const useTripStore = create<TripState>((set, get) => {
           metersPerSecond: simSpeedFor(route),
           speedProfile: speedProfile(route, boundaries),
           speedMultiplier: () => get().simSpeed,
+          jitterMeters: resolveSimJitter(),
         },
       )
       driveController.start()
@@ -449,7 +483,14 @@ export const useTripStore = create<TripState>((set, get) => {
       const controller = driveController
       endDrive()
       if (get().navPhase === 'navigating') {
-        set({ navPhase: 'idle', currentPosition: null, navProgress: 0, guidance: null })
+        set({
+          navPhase: 'idle',
+          currentPosition: null,
+          navFix: null,
+          gpsSignalLost: false,
+          navProgress: 0,
+          guidance: null,
+        })
       }
       // Await the final flush so a caller that completes the trip next does so
       // with the whole trace already server-side (see DriveController.stop).
@@ -482,6 +523,8 @@ export const useTripStore = create<TripState>((set, get) => {
         mode: 'auto',
         navPhase: 'idle',
         currentPosition: null,
+        navFix: null,
+        gpsSignalLost: false,
         navProgress: 0,
         guidance: null,
         arrived: false,
