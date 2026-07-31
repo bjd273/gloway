@@ -6,8 +6,11 @@ import { useSystemTheme } from '../hooks/useSystemTheme'
 import { LOCATION_FAILURE_MESSAGE, requestCurrentLocation } from '../lib/geolocate'
 import { getMapStyle, type Theme } from '../lib/mapStyles'
 import { MAP_MAX_BOUNDS, REGION_CENTER } from '../lib/region'
+import { DriveCamera, type Padding } from '../lib/driveCamera'
 import { ALT_LAYER, removeRouteLayers, setRouteProgress, syncRouteLayers } from '../lib/routeLayers'
-import { bearingAtFraction, lengthFractions } from '../lib/routeProgress'
+import { bearingAtFraction, cumulativeMeters, lengthFractions } from '../lib/routeProgress'
+import { clamp, lerpAngle } from '../lib/smoothing'
+import { pointAtMeters } from '../lib/snapToRoute'
 import { useSheetStore } from '../stores/useSheetStore'
 import { useTripStore, type Place } from '../stores/useTripStore'
 
@@ -30,10 +33,19 @@ const NAV_PITCH = 55
 // is renamed there, the click silently stops working for that rank, so the
 // names are asserted at map load (see the warning below).
 const POI_LAYERS = ['poi_r20', 'poi_r7', 'poi_r1', 'poi_transit']
-// Shorter than the tightest gap between position updates (sim ticks at 800ms,
-// real fixes are throttled to 1000ms) so each ease lands before the next one
-// starts. Overlapping eases read as the camera drifting rather than tracking.
-const NAV_EASE_MS = 650
+
+/**
+ * How far ahead down the route the camera reads its bearing from.
+ *
+ * Three seconds of road, bounded. A fixed 60m was calm on a highway and
+ * sluggish in a neighbourhood; scaling it means the camera leans into a turn at
+ * roughly the same moment regardless of speed. The averaging over that span is
+ * what smooths per-shape-point wobble through a curve, so the lower bound
+ * matters as much as the upper one.
+ */
+function lookaheadFor(speedMps: number): number {
+  return clamp(speedMps * 3, 40, 120)
+}
 
 // The locate crosshair, as a path so the two places that draw it — the JSX
 // pill and the imperative MapLibre control — cannot drift apart.
@@ -47,7 +59,7 @@ const CROSSHAIR_PATH =
  * bottom trip panel, neither of which exists now. Top only has to clear the
  * corner-anchored wordmark and gear; bottom tracks the sheet's measured height.
  */
-function fitPadding(map: maplibregl.Map): maplibregl.PaddingOptions {
+function fitPadding(map: maplibregl.Map): Padding {
   const height = map.getContainer().clientHeight
   if (window.matchMedia('(min-width: 768px)').matches) {
     // Desktop puts the sheet in the LEFT corner. The old code applied phone
@@ -76,7 +88,7 @@ function fitPadding(map: maplibregl.Map): maplibregl.PaddingOptions {
  * the top adds the turn banner's measured height — without that the banner
  * covers the road ahead, which is the part of the map the tilt exists for.
  */
-function navPadding(map: maplibregl.Map): maplibregl.PaddingOptions {
+function navPadding(map: maplibregl.Map): Padding {
   const height = map.getContainer().clientHeight
   const banner = useSheetStore.getState().bannerPx
   // Clamped so a tall banner on a short viewport can't push top + bottom past
@@ -112,6 +124,11 @@ export function MapView() {
   )
   const stopMarkersRef = useRef<maplibregl.Marker[]>([])
   const puckRef = useRef<maplibregl.Marker | null>(null)
+  const driveCameraRef = useRef<DriveCamera | null>(null)
+  // True while recenter()'s one-off ease is covering the gap back to the puck.
+  // The loop must not restart underneath it: its first jumpTo would cancel the
+  // ease (jumpTo calls stop()) and strand the camera wherever it had got to.
+  const reacquiringRef = useRef(false)
   const deviceMarkerRef = useRef<maplibregl.Marker | null>(null)
   const autoPitchedRef = useRef(false)
   const userPitchedRef = useRef(false)
@@ -150,11 +167,14 @@ export function MapView() {
   const currentPosition = useTripStore((s) => s.currentPosition)
   const navPhase = useTripStore((s) => s.navPhase)
   const navProgress = useTripStore((s) => s.navProgress)
+  const navFix = useTripStore((s) => s.navFix)
+  const gpsSignalLost = useTripStore((s) => s.gpsSignalLost)
 
   // Cumulative length fractions for the selected route, rebuilt only when the
   // geometry itself changes — not on every fix, which is when they're read.
   const selectedCoords = routes[selectedIndex]?.coords
   const fractions = useMemo(() => lengthFractions(selectedCoords ?? []), [selectedCoords])
+  const cumulative = useMemo(() => cumulativeMeters(selectedCoords ?? []), [selectedCoords])
 
   // --- map construction (once) ---
   useEffect(() => {
@@ -210,6 +230,12 @@ export function MapView() {
     )
 
     map.on('moveend', () => {
+      // Skipped while driving. The camera loop writes with jumpTo, which fires
+      // movestart/move/moveend on EVERY call — so without this guard a drive
+      // would push sixty store updates a second, re-rendering every subscriber,
+      // for a value ("where is the map centred") that only means anything while
+      // planning.
+      if (navigatingRef.current) return
       const c = map.getCenter()
       useTripStore.getState().setMapCenter({ lng: c.lng, lat: c.lat, label: 'Map center' })
     })
@@ -235,11 +261,17 @@ export function MapView() {
 
     // Touching the map mid-drive hands the camera back to the driver — a
     // passenger checking what's two blocks over should not be fought for it.
-    // `originalEvent` is the tell: our own easeTo fires the same events
-    // without one, so this can't trip on the camera we're driving ourselves.
+    // `originalEvent` is the tell: our own easeTo and the camera loop's jumpTo
+    // both fire these events without one (the loop does so ~60x a second), so
+    // this can't trip on the camera we're driving ourselves.
+    //
+    // Pausing the loop is the important half: it writes with jumpTo, which
+    // calls stop() internally, so a running loop would cancel the driver's own
+    // drag inertia on its very next frame.
     const releaseFollow = (e: { originalEvent?: unknown }) => {
       if (!navigatingRef.current || !followRef.current || !e.originalEvent) return
       followRef.current = false
+      driveCameraRef.current?.pause()
       setFollowSuspended(true)
     }
     map.on('dragstart', releaseFollow)
@@ -355,16 +387,52 @@ export function MapView() {
   }, [navProgress])
 
   // --- live position puck + driving camera ---
+  //
+  // This effect no longer moves anything itself. It computes a target and hands
+  // it to DriveCamera, which interpolates toward it every frame. See
+  // driveCamera.ts for why: a single easeTo per fix left the camera idle for a
+  // third of every second, which is the "not smooth" a driver reported.
   useEffect(() => {
     const map = mapRef.current
     if (!map) return
     if (!currentPosition) {
-      puckRef.current?.remove()
+      driveCameraRef.current?.stop()
+      driveCameraRef.current = null
       puckRef.current = null
       return
     }
 
-    const heading = bearingAtFraction(selectedCoords ?? [], fractions, navProgress)
+    // Two different questions, two different answers.
+    //
+    // The camera faces where the ROAD goes, read 3 seconds ahead (see
+    // bearingAtFraction's lookahead) — that is where the anticipatory rotation
+    // into a turn comes from, and it is the part the driver liked. It also
+    // cannot spin at a red light, because a stationary car's route bearing
+    // doesn't change.
+    //
+    // The puck's arrow points where the CAR is pointing, from GPS course over
+    // ground. That is correct even off-route, which the route bearing is not —
+    // and being wrong there is what made the heading feel unresponsive.
+    //
+    // As snap confidence falls the two converge: once you have genuinely left
+    // the route, following the road you're not on is the wrong thing to do, so
+    // the camera blends toward the car's own course.
+    const speed = navFix?.speedMps ?? 0
+    const routeBearing = bearingAtFraction(
+      selectedCoords ?? [],
+      fractions,
+      navProgress,
+      lookaheadFor(speed),
+    )
+    const course = navFix?.courseDeg ?? null
+    const confidence = navFix?.snapConfidence ?? 0
+    const cameraBearing =
+      routeBearing === null
+        ? course
+        : course === null
+          ? routeBearing
+          : lerpAngle(course, routeBearing, confidence)
+    const puckBearing = course ?? routeBearing
 
     if (!puckRef.current) {
       puckRef.current = new maplibregl.Marker({
@@ -377,24 +445,59 @@ export function MapView() {
       })
         .setLngLat([currentPosition.lng, currentPosition.lat])
         .addTo(map)
-    } else {
-      puckRef.current.setLngLat([currentPosition.lng, currentPosition.lat])
     }
-    // Until there's a direction to show, it stays a plain dot — an arrow
-    // pointing an arbitrary way is worse than no arrow.
-    puckRef.current.getElement().classList.toggle('gw-puck-heading', heading !== null)
-    puckRef.current.setRotation(heading ?? 0)
 
-    if (navPhase !== 'navigating' || !followRef.current) return
-    map.easeTo({
-      center: [currentPosition.lng, currentPosition.lat],
-      bearing: heading ?? map.getBearing(),
+    if (navPhase !== 'navigating') {
+      // Outside a drive there is no loop; place the puck directly.
+      puckRef.current.setLngLat([currentPosition.lng, currentPosition.lat])
+      puckRef.current.getElement().classList.toggle('gw-puck-heading', puckBearing !== null)
+      puckRef.current.setRotation(puckBearing ?? 0)
+      return
+    }
+
+    if (!driveCameraRef.current) {
+      driveCameraRef.current = new DriveCamera({
+        map,
+        puck: puckRef.current,
+        // Dead reckoning walks the route's own geometry, so it stays on the
+        // road through a curve. Rebound whenever the route changes.
+        pointAtMeters: (meters) =>
+          pointAtMeters(selectedCoords ?? [], cumulative, meters),
+      })
+    }
+
+    // Start (or restart) here rather than in the navPhase effect below, which
+    // runs after this one: on the render where a drive begins, followRef is
+    // still false while this effect runs. Checking every update instead makes
+    // the loop's running state self-healing regardless of effect ordering.
+    if (followRef.current && !reacquiringRef.current && !driveCameraRef.current.isRunning) {
+      driveCameraRef.current.start()
+    }
+
+    driveCameraRef.current.setTarget({
+      lng: currentPosition.lng,
+      lat: currentPosition.lat,
+      bearing: cameraBearing ?? map.getBearing(),
+      puckBearing,
       zoom: NAV_ZOOM,
       pitch: NAV_PITCH,
       padding: navPadding(map),
-      duration: NAV_EASE_MS,
+      routeMeters: navProgress * (cumulative[cumulative.length - 1] ?? 0),
+      speedMps: speed,
+      // Only extrapolate when we believe the driver is on the route and fixes
+      // are still arriving. During a signal outage the puck freezes instead.
+      deadReckon: confidence >= 0.5 && !gpsSignalLost,
     })
-  }, [currentPosition, navPhase, navProgress, selectedCoords, fractions])
+  }, [
+    currentPosition,
+    navFix,
+    navPhase,
+    navProgress,
+    selectedCoords,
+    fractions,
+    cumulative,
+    gpsSignalLost,
+  ])
 
   // --- entering / leaving the drive ---
   useEffect(() => {
@@ -417,6 +520,12 @@ export function MapView() {
     setFollowSuspended(false)
     autoPitchedRef.current = false
     userPitchedRef.current = false
+    // Ordering is load-bearing: stop the loop BEFORE starting the unwind. One
+    // stray frame after fitBounds begins would cancel it (jumpTo calls stop()
+    // internally) and leave the camera frozen mid-flight on a rooftop.
+    driveCameraRef.current?.stop()
+    driveCameraRef.current = null
+    puckRef.current = null
     const coords = useTripStore.getState().routes[useTripStore.getState().selectedIndex]?.coords
     if (coords && coords.length > 1) {
       const bounds = coords.reduce(
@@ -435,20 +544,56 @@ export function MapView() {
     }
   }, [navPhase])
 
+  /**
+   * Re-arm following after the driver has panned away.
+   *
+   * The one case where the loop's exponential chase is the wrong tool: after a
+   * pan the camera can be a mile off and pointing anywhere, and closing that
+   * gap at the tracking time constant is a long, fast, nauseating swoop. So the
+   * loop stands down, a plain 600ms ease covers the distance, and the loop picks
+   * up from wherever that lands.
+   *
+   * The timeout is not belt-and-braces: a user gesture during the ease can
+   * swallow `moveend` entirely, and without it the loop would never restart.
+   * `resume` is written to be safe to call twice.
+   */
   function recenter() {
     const map = mapRef.current
     const position = useTripStore.getState().currentPosition
     if (!map || !position) return
     followRef.current = true
     setFollowSuspended(false)
+
+    const camera = driveCameraRef.current
+    camera?.pause()
+    reacquiringRef.current = true
+
+    let resumed = false
+    const resume = () => {
+      if (resumed) return
+      resumed = true
+      reacquiringRef.current = false
+      if (!followRef.current) return
+      camera?.reseedFromMap()
+      camera?.start()
+    }
+
     map.easeTo({
       center: [position.lng, position.lat],
-      bearing: bearingAtFraction(selectedCoords ?? [], fractions, navProgress) ?? map.getBearing(),
+      bearing:
+        bearingAtFraction(
+          selectedCoords ?? [],
+          fractions,
+          navProgress,
+          lookaheadFor(useTripStore.getState().navFix?.speedMps ?? 0),
+        ) ?? map.getBearing(),
       zoom: NAV_ZOOM,
       pitch: NAV_PITCH,
       padding: navPadding(map),
       duration: 600,
     })
+    map.once('moveend', resume)
+    window.setTimeout(resume, 800)
   }
 
   // --- "you are here" dot, outside navigation ---
@@ -619,6 +764,14 @@ export function MapView() {
     const timer = setTimeout(() => {
       // Mid-drive the puck, not the whole route, is what has to stay clear of
       // the sheet — so the nudge follows whichever camera mode is active.
+      // While the loop owns the camera the nudge has to go THROUGH it: an
+      // easeTo here would be cancelled by the loop's next frame anyway. Padding
+      // then glides in on the framing time constant rather than in 300ms, which
+      // suits a sheet that is itself sliding.
+      if (navigatingRef.current && driveCameraRef.current) {
+        driveCameraRef.current.setPadding(navPadding(map))
+        return
+      }
       map.easeTo({
         padding: navigatingRef.current ? navPadding(map) : fitPadding(map),
         duration: 300,
