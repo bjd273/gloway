@@ -90,11 +90,9 @@ if ./data/download_overture.sh; then
   PLACES_OK=1
 else
   PLACES_OK=0
-  warn "Skipped — the overturemaps CLI isn't available."
-  echo "      Install uv (which provides uvx), then re-run this script:"
-  echo "        brew install uv"
-  echo "      Destination search still works meanwhile: it falls back to"
-  echo "      Nominatim/OSM, just with fewer place-name matches."
+  warn "Failed — the download needs network access to Overture's S3 bucket."
+  echo "      Destination search still works meanwhile: it falls back to the"
+  echo "      OSM POI index and Nominatim, just with fewer place-name matches."
 fi
 
 # --- 5. Frontend coverage gate ---------------------------------------------

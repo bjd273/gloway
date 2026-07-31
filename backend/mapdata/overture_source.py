@@ -26,6 +26,7 @@ import duckdb
 
 from mapdata.base import MapDataSource
 from mapdata.models import Address, BBox, Place, PlaceCategory, RoutingGraphRef
+from mapdata.places_coverage import check_coverage
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,16 @@ class OvertureMapDataSource(MapDataSource):
                 "data/download_overture.sh; place queries return empty.",
                 self._path,
             )
+            return
+
+        # A present-but-undersized extract is the failure that actually bit us:
+        # every query succeeds and simply finds nothing outside the box the
+        # parquet was built for, so there is no error to notice. Say it loudly
+        # at startup instead. Warn only — an extract short on one edge is still
+        # far better than no search at all, so it must not stop the service.
+        coverage = check_coverage(f"{self._path}.state", settings.region_json_path)
+        if not coverage.ok:
+            logger.warning("Places coverage: %s", coverage.message)
 
     def _query(self, sql: str, params: list) -> list[tuple]:
         # Fresh in-memory connection per query: duckdb is embedded and sync,

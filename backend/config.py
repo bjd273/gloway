@@ -38,6 +38,21 @@ class Settings(BaseSettings):
         Path(__file__).resolve().parents[1] / "data" / "overture" / "places.parquet"
     )
 
+    # Local OSM POI index, built from the SAME region.osm.pbf that Planetiler
+    # turns into the basemap's label layer (regenerate via
+    # data/build_osm_places.sh). Having it means anything the map labels is
+    # findable by name, which Overture alone does not guarantee — the two use
+    # different vocabularies for the same real-world place.
+    osm_places_path: str = str(
+        Path(__file__).resolve().parents[1] / "data" / "osm" / "places.parquet"
+    )
+
+    # The region every derived artifact must cover. Read at startup to check the
+    # places extracts against it; see mapdata/places_coverage.py.
+    region_json_path: str = str(
+        Path(__file__).resolve().parents[1] / "data" / "region.json"
+    )
+
     # LLM conversation layer (Phase 2). Provider is a seam like map_data_source:
     # "gemini" today, "claude" when an Anthropic key is provisioned — see
     # backend/ml/llm/factory.py. Empty api key = conversation features off
