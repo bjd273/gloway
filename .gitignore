@@ -7,6 +7,9 @@ token.json
 # OSM data downloads (regenerate via data/download_osm.sh)
 data/osm/*.pbf
 
+# OSM POI search index (regenerate via data/build_osm_places.sh)
+data/osm/*.parquet
+
 # Overture places extract (regenerate via data/download_overture.sh)
 data/overture/*.parquet*
 

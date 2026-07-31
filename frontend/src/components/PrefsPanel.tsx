@@ -39,6 +39,7 @@ function formatPlace(place: LatLon | null): string {
 
 export function PrefsPanel() {
   const [open, setOpen] = useState(false)
+  const navPhase = useTripStore((s) => s.navPhase)
   const [emailInput, setEmailInput] = useState('')
   /** Which place row is in edit mode, if any. */
   const [editing, setEditing] = useState<PlaceKey | null>(null)
@@ -117,7 +118,10 @@ export function PrefsPanel() {
   return (
     <>
       <button
-        className="prefs-button"
+        // The turn banner claims the top strip during a drive, and this sits
+        // above everything at z-index 30 — so without moving it the gear
+        // renders on top of the banner and covers its mute button.
+        className={'prefs-button' + (navPhase === 'navigating' ? ' prefs-button--below-banner' : '')}
         aria-label="Driving preferences"
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}

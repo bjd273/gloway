@@ -5,6 +5,7 @@ import { MapView } from './components/MapView'
 import { PrefsPanel } from './components/PrefsPanel'
 import { Sheet } from './components/Sheet'
 import { TripSheet } from './components/TripSheet'
+import { TurnBanner } from './components/TurnBanner'
 import { Wordmark } from './components/Wordmark'
 import { useUserStore } from './stores/useUserStore'
 
@@ -16,13 +17,18 @@ function App() {
   }, [])
 
   // Everything floats over a full-bleed map. Stacking order, low to high:
-  // map (0) → wordmark (20) → sheet (25) → assistant bubble (28) → prefs (30).
-  // The bubble is a sibling of the sheet, not a child: inside it, the sheet's
-  // overflow would clip it and the sheet's scrolling would drag it around.
+  // map (0) → wordmark (20) → turn banner (22) → sheet (25) → assistant
+  // bubble (28) → prefs (30). The bubble is a sibling of the sheet, not a
+  // child: inside it, the sheet's overflow would clip it and the sheet's
+  // scrolling would drag it around.
+  //
+  // The turn banner takes the top of the screen during a drive, which is why
+  // Wordmark stands down while navigating rather than sitting under it.
   return (
     <>
       <MapView />
       <Wordmark />
+      <TurnBanner />
       <PrefsPanel />
       <AssistantBubble />
       <Sheet>

@@ -45,7 +45,10 @@ export function PlaceSearchField({
   // Debounced search-as-you-type.
   useEffect(() => {
     abortRef.current?.abort()
-    if (query.trim().length < 3) {
+    // Two, not three: plenty of real destinations are short ("QT", "HEB", a
+    // street number), and the search is a local parquet scan behind a 250ms
+    // debounce, so the extra keystroke bought nothing.
+    if (query.trim().length < 2) {
       setSuggestions([])
       setIsSearching(false)
       return

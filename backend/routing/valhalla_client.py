@@ -141,6 +141,7 @@ class ValhallaRouter:
         alternatives: int = 3,                 # always request alternates for RL training data
         costing: str = "auto",                 # "auto" | "bicycle" | "pedestrian"
         costing_overrides: Optional[dict] = None,
+        response_format: Optional[str] = None,  # None = Valhalla's native shape
     ) -> dict:
         """`costing_overrides` are merged over the preference-derived options.
 
@@ -150,6 +151,15 @@ class ValhallaRouter:
         replace the person. Applies to any costing, since bike and pedestrian
         have their own useful knobs (use_roads, use_lit) even though the
         preference translation below is auto-only.
+
+        `response_format="osrm"` asks for the same route in Valhalla's OSRM
+        shape. That format is NOT a drop-in replacement and must never become
+        the default: `trips.suggested_route` is persisted in the native shape
+        and read back by signal_processor and train_route_scorer. It exists for
+        one reason — lane guidance. Valhalla 3.5.1 emits turn lanes only under
+        OSRM (as `steps[].intersections[].lanes`); the native maneuver has no
+        lane field at all, and the `turn_lanes` request flag the docs describe
+        is silently ignored by this build. See routing/lane_guidance.py.
         """
         if prefs is None:
             prefs = UserRoutingPrefs()
@@ -166,6 +176,9 @@ class ValhallaRouter:
             "directions_options": {
                 "units": "miles",
                 "language": "en-US",
+                # Also what makes the verbal_* strings appear — the purpose-built
+                # spoken forms of each maneuver, which the turn announcer reads
+                # aloud instead of the on-screen text.
                 "narrative": True,
             },
         }
@@ -178,6 +191,8 @@ class ValhallaRouter:
         if costing_overrides:
             options = payload.setdefault("costing_options", {}).setdefault(costing, {})
             options.update(costing_overrides)
+        if response_format:
+            payload["format"] = response_format
 
         response = await self._client.post(
             f"{self.base_url}/route",

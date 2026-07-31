@@ -4,6 +4,7 @@ import type { ParsedRoute } from './api'
 import {
   abbreviateRoad,
   formatDelta,
+  formatDistanceToTurn,
   formatMiles,
   formatMinutes,
   routeDisplayOrder,
@@ -37,6 +38,30 @@ describe('formatMinutes', () => {
   it('never renders a zero-minute trip', () => {
     expect(formatMinutes(0.6)).toBe('1 min')
     expect(formatMinutes(0)).toBe('1 min')
+  })
+})
+
+describe('formatDistanceToTurn', () => {
+  it('says Now once the junction is the thing to look at', () => {
+    expect(formatDistanceToTurn(0)).toBe('Now')
+    expect(formatDistanceToTurn(29)).toBe('Now')
+  })
+
+  it('rounds feet to 50 so the number is actionable, not precise', () => {
+    // formatMiles would render 419, 407, 395 — noise at 40 mph, and precision
+    // nobody can act on. Nav apps land on the same few round values.
+    expect(formatDistanceToTurn(120)).toBe('400 ft')
+    expect(formatDistanceToTurn(125)).toBe('400 ft')
+    expect(formatDistanceToTurn(150)).toBe('500 ft')
+  })
+
+  it('switches to miles once feet stop being useful', () => {
+    expect(formatDistanceToTurn(800)).toBe('0.5 mi')
+    expect(formatDistanceToTurn(3000)).toBe('1.9 mi')
+  })
+
+  it('drops the decimal on long hauls', () => {
+    expect(formatDistanceToTurn(40_000)).toBe('25 mi')
   })
 })
 

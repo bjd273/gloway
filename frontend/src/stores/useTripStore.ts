@@ -9,12 +9,95 @@ import { create } from 'zustand'
 
 import { FriendlyError, getRoute, type ParsedRoute, type TravelMode } from '../lib/api'
 import { resolveOrigin } from '../lib/geolocate'
-import { DriveController, type DriveMode, resolveDriveMode } from '../lib/navigation'
+import { ManeuverTracker, type ManeuverProgress, stepBoundaries } from '../lib/maneuvers'
+import { TurnAnnouncer } from '../lib/navAnnounce'
+import {
+  DriveController,
+  type DriveMode,
+  type DrivePosition,
+  resolveDriveMode,
+  resolveSimJitter,
+} from '../lib/navigation'
+import { cumulativeMeters } from '../lib/routeProgress'
+import { primeSpeech, speak } from '../lib/voice'
 import { useUserStore } from './useUserStore'
+import { useVoiceStore } from './useVoiceStore'
+
+const METERS_PER_MILE = 1609.344
 
 // The active drive's streaming controller. Non-serializable, so it lives
 // outside zustand state — the store just starts/stops it.
 let driveController: DriveController | null = null
+
+// Turn guidance for the drive in progress. Module-scoped for the same reason as
+// the controller: both are mutable machines, not rendered state. They are
+// created together in startNavigation and MUST be torn down together — a
+// tracker outliving its drive would hand the next trip a step index from the
+// last one.
+let maneuverTracker: ManeuverTracker | null = null
+let turnAnnouncer: TurnAnnouncer | null = null
+let routeMeters = 0
+
+// How fast a simulated drive plays back. 4x by default: 1x is the honest
+// speed and the right setting for checking that a turn countdown looks
+// believable, but sitting through a 25-minute route in real time is not a
+// development loop.
+const SIM_SPEED_KEY = 'gloway:simSpeed'
+export const SIM_SPEEDS = [1, 4, 8] as const
+export type SimSpeed = (typeof SIM_SPEEDS)[number]
+
+function initialSimSpeed(): SimSpeed {
+  const stored = Number(localStorage.getItem(SIM_SPEED_KEY))
+  return (SIM_SPEEDS as readonly number[]).includes(stored) ? (stored as SimSpeed) : 4
+}
+
+/**
+ * Release everything belonging to the drive that just ended.
+ *
+ * One function rather than four copies, because these three have to die
+ * together: a tracker that outlived its drive would report a step index from
+ * the previous trip, and an announcer would think every turn had already been
+ * spoken. There are four ways a drive ends (arrival, GPS failure, manual stop,
+ * clearing the trip) and getting three of them right is the same bug.
+ *
+ * Callers set their own navPhase/position afterwards — this only owns the
+ * machinery, not what the UI shows next.
+ */
+function endDrive(): void {
+  driveController = null
+  maneuverTracker = null
+  turnAnnouncer = null
+  routeMeters = 0
+}
+
+/** The route's average pace, for a sim that takes about as long as the drive
+ * would. Falls back to the controller's own default on a route that reported
+ * no usable duration. */
+function simSpeedFor(route: ParsedRoute): number | undefined {
+  const seconds = route.minutes * 60
+  if (!(seconds > 0) || !(route.miles > 0)) return undefined
+  return (route.miles * METERS_PER_MILE) / seconds
+}
+
+/**
+ * Per-step speeds, so a simulated drive crawls through a neighbourhood and
+ * opens up on an arterial instead of gliding at one average that matches
+ * neither — which is what makes a turn countdown look plausible.
+ *
+ * Steps with no time (Valhalla emits zero-duration maneuvers at junctions) are
+ * left out; the controller falls back to the route average for those stretches.
+ */
+function speedProfile(
+  route: ParsedRoute,
+  boundaries: number[],
+): { endMeters: number; metersPerSecond: number }[] {
+  return route.steps
+    .map((step, i) => ({
+      endMeters: boundaries[i] ?? 0,
+      metersPerSecond: step.seconds > 0 ? (step.miles * METERS_PER_MILE) / step.seconds : 0,
+    }))
+    .filter((band) => band.metersPerSecond > 0)
+}
 
 // Persisted drive-mode choice (Live GPS vs Simulated). A device habit, not
 // routing data — same manual-localStorage pattern as useVoiceStore. Order of
@@ -78,8 +161,32 @@ interface TripState {
   navPhase: NavPhase
   /** Live position during navigation (the moving puck). */
   currentPosition: Place | null
+  /**
+   * The full detail behind `currentPosition`: raw vs snapped coordinates,
+   * course over ground, speed, accuracy, snap confidence.
+   *
+   * A sibling field rather than fatter `Place` because `Place` is also an
+   * origin, a destination and a saved home — none of which have a heading.
+   * Written in the same `set()` as `currentPosition`, so the two can never
+   * describe different moments.
+   */
+  navFix: DrivePosition | null
+  /** Real mode: fixes have stopped arriving (tunnel, garage). The drive is
+   * still live — the puck just freezes until the signal comes back. */
+  gpsSignalLost: boolean
   /** Fraction 0..1 driven along the selected route. */
   navProgress: number
+  /**
+   * Which turn is next and how far to it. Null outside navigation.
+   *
+   * The single source of truth for step position. TripSheet's step highlight
+   * and NavVoice's assistant context each used to re-derive this from
+   * cumulative miles, in duplicated loops that disagreed at leg boundaries, and
+   * neither could detect a step *transition* — so nothing could fire on one.
+   */
+  guidance: ManeuverProgress | null
+  /** Playback speed for a simulated drive (1x, 4x, 8x). Persisted. */
+  simSpeed: SimSpeed
   /** Set when a drive reaches its destination — TripPanel opens the debrief. */
   arrived: boolean
   /** Fallback origin when geolocation is unavailable — MapView keeps it fresh. */
@@ -103,6 +210,8 @@ interface TripState {
   setMode(mode: TravelMode): void
   /** Switch how the next drive is sourced (Live GPS vs Simulated). */
   setDriveMode(mode: DriveMode): void
+  /** Change simulated playback speed. Takes effect mid-drive. */
+  setSimSpeed(speed: SimSpeed): void
   /** Minutes elapsed on the drive just finished, for the completion endpoint's
    * time term — or null when there's nothing honest to report. */
   driveDurationMinutes(): number | null
@@ -177,7 +286,11 @@ export const useTripStore = create<TripState>((set, get) => {
     driveMode: initialDriveMode(),
     navPhase: 'idle',
     currentPosition: null,
+    navFix: null,
+    gpsSignalLost: false,
     navProgress: 0,
+    guidance: null,
+    simSpeed: initialSimSpeed(),
     arrived: false,
     mapCenter: { lng: -97.11, lat: 32.735, label: 'Map center' },
 
@@ -255,11 +368,20 @@ export const useTripStore = create<TripState>((set, get) => {
       set({ driveMode: mode })
     },
 
+    setSimSpeed(speed) {
+      if (get().simSpeed === speed) return
+      localStorage.setItem(SIM_SPEED_KEY, String(speed))
+      // The controller reads this through a closure on every tick, so a change
+      // mid-drive takes hold on the next one — no restart, no lost progress.
+      set({ simSpeed: speed })
+    },
+
     driveDurationMinutes() {
-      // Sim drives take a fixed ~36s regardless of route length, so reporting
-      // that would hand every simulated trip the same large "arrived early"
-      // bonus — a constant, not a signal. Only a real drive's clock means
-      // anything; sim leaves the time term at its neutral default.
+      // A simulated drive runs at whatever the speed multiplier says, so its
+      // wall-clock duration measures the playback setting rather than the
+      // route. Reporting it would feed the reward's time term a number about
+      // the UI. Only a real drive's clock means anything; sim leaves the time
+      // term at its neutral default.
       if (navStartedAt === null || get().driveMode !== 'real') return null
       return (Date.now() - navStartedAt) / 60_000
     },
@@ -267,39 +389,108 @@ export const useTripStore = create<TripState>((set, get) => {
     startNavigation() {
       const { routes, selectedIndex, tripId, origin, navPhase } = get()
       if (navPhase === 'navigating' || !tripId) return
-      const coords = routes[selectedIndex]?.coords ?? []
+      const route = routes[selectedIndex]
+      const coords = route?.coords ?? []
       if (coords.length < 2) return
 
       void driveController?.stop()
       navStartedAt = Date.now()
-      set({ navPhase: 'navigating', navProgress: 0, arrived: false, currentPosition: origin })
-      driveController = new DriveController(tripId, coords, {
-        onPosition: (p) => set({ currentPosition: { lng: p.lng, lat: p.lat, label: 'You' } }),
-        onProgress: (fraction) => set({ navProgress: fraction }),
-        onArrive: () => {
-          driveController = null
-          set({ navPhase: 'idle', navProgress: 1, arrived: true })
+
+      // iOS Safari won't speak until speechSynthesis has been used inside a
+      // user gesture, and it fails silently. This runs in the Start-drive
+      // click, the one tap every drive begins with.
+      primeSpeech()
+
+      const cumulative = cumulativeMeters(coords)
+      routeMeters = cumulative[cumulative.length - 1] ?? 0
+      const boundaries = stepBoundaries(route.steps, cumulative)
+      maneuverTracker = new ManeuverTracker(boundaries)
+      turnAnnouncer = new TurnAnnouncer(route.steps, speak, () =>
+        useVoiceStore.getState().voiceGuidance,
+      )
+
+      set({
+        navPhase: 'navigating',
+        navProgress: 0,
+        navFix: null,
+        gpsSignalLost: false,
+        guidance: null,
+        arrived: false,
+        currentPosition: origin,
+      })
+      driveController = new DriveController(
+        tripId,
+        coords,
+        {
+          // Both written in one set(): `currentPosition` stays the simple
+          // {lng,lat} compatibility surface everything already reads, and
+          // `navFix` carries what the camera and the puck arrow need. Writing
+          // them together is what stops the two describing different moments.
+          onPosition: (p) =>
+            set({ currentPosition: { lng: p.lng, lat: p.lat, label: 'You' }, navFix: p }),
+          onProgress: (fraction) => {
+            // No separate handler for guidance: `fraction * routeMeters` IS the
+            // distance driven, in both modes, by construction. A parallel
+            // channel would be a second source for one number, free to drift.
+            const guidance = maneuverTracker?.update(fraction * routeMeters) ?? null
+            // Announcing here rather than in a React effect keyed on
+            // `guidance`: this runs exactly once per position update, with no
+            // dependence on render timing, StrictMode double-invocation or
+            // subscriber ordering.
+            if (guidance) turnAnnouncer?.update(guidance)
+            set({ navProgress: fraction, guidance })
+          },
+          onArrive: () => {
+            endDrive()
+            set({ navPhase: 'idle', navProgress: 1, arrived: true })
+          },
+          // Real mode only: no fixes means no drive (and no trace to learn
+          // from) — end navigation and say why instead of showing a frozen puck.
+          onGpsError: (message) => {
+            endDrive()
+            set({
+              navPhase: 'idle',
+              currentPosition: null,
+              navFix: null,
+              navProgress: 0,
+              errorMessage: message,
+            })
+          },
+          // A tunnel or a parking garage, not a dead drive. The puck freezes
+          // where it was and the banner says so; the watch keeps retrying and
+          // this flips back on the next good fix.
+          onGpsSignal: (lost) => set({ gpsSignalLost: lost }),
         },
-        // Real mode only: no fixes means no drive (and no trace to learn
-        // from) — end navigation and say why instead of showing a frozen puck.
-        onGpsError: (message) => {
-          driveController = null
-          set({ navPhase: 'idle', currentPosition: null, navProgress: 0, errorMessage: message })
+        get().driveMode,
+        undefined,
+        {
+          // The route's own average pace, so a simulated drive takes about as
+          // long as the real one would at 1x.
+          metersPerSecond: simSpeedFor(route),
+          speedProfile: speedProfile(route, boundaries),
+          speedMultiplier: () => get().simSpeed,
+          jitterMeters: resolveSimJitter(),
         },
-      },
-      get().driveMode)
+      )
       driveController.start()
       // Note on reroutes: in real mode a post-reroute restart naturally
       // resumes from the live GPS fix (the device is the source of truth) and
-      // the first fix's nearest-point projection lands navProgress mid-route
+      // the first fix's projection lands navProgress mid-route
       // correctly. Only the sim replays from the route's start.
     },
 
     async stopNavigation() {
       const controller = driveController
-      driveController = null
+      endDrive()
       if (get().navPhase === 'navigating') {
-        set({ navPhase: 'idle', currentPosition: null, navProgress: 0 })
+        set({
+          navPhase: 'idle',
+          currentPosition: null,
+          navFix: null,
+          gpsSignalLost: false,
+          navProgress: 0,
+          guidance: null,
+        })
       }
       // Await the final flush so a caller that completes the trip next does so
       // with the whole trace already server-side (see DriveController.stop).
@@ -316,7 +507,7 @@ export const useTripStore = create<TripState>((set, get) => {
 
     clearTrip() {
       driveController?.stop()
-      driveController = null
+      endDrive()
       set({
         origin: null,
         destination: null,
@@ -332,7 +523,10 @@ export const useTripStore = create<TripState>((set, get) => {
         mode: 'auto',
         navPhase: 'idle',
         currentPosition: null,
+        navFix: null,
+        gpsSignalLost: false,
         navProgress: 0,
+        guidance: null,
         arrived: false,
       })
     },

@@ -22,23 +22,18 @@ function computeNavContext(): NavContext {
     return { destLabel, progress: s.navProgress, minutesRemaining: null, nextManeuver: null }
   }
   const minutesRemaining = Math.max(0, selected.minutes * (1 - s.navProgress))
-  // Next maneuver from progress along total distance — same derivation TripPanel
-  // uses to highlight the current step.
-  const drivenMiles = s.navProgress * selected.miles
-  let cumulative = 0
-  let stepIndex = selected.steps.length - 1
-  for (let i = 0; i < selected.steps.length; i += 1) {
-    cumulative += selected.steps[i].miles
-    if (drivenMiles <= cumulative) {
-      stepIndex = i
-      break
-    }
-  }
+  // The drive controller's own step tracking, not a second derivation of it.
+  // This used to recompute the step from cumulative miles — as did TripSheet —
+  // and the two disagreed at leg boundaries.
+  const stepIndex = s.guidance?.stepIndex ?? 0
   return {
     destLabel,
     progress: s.navProgress,
     minutesRemaining,
     nextManeuver: selected.steps[stepIndex]?.text ?? null,
+    // Lets the assistant answer "how far to my exit?" with a number rather
+    // than a fraction of the whole trip.
+    metersToManeuver: s.guidance?.metersToManeuver ?? null,
   }
 }
 

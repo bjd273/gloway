@@ -99,11 +99,23 @@ class OSMMapDataSource(MapDataSource):
         )
 
     async def search_addresses(self, query: str, limit: int = 5) -> list[Address]:
-        response = await self._client.get(
-            _NOMINATIM_URL,
-            params={"q": query, "format": "json", "limit": limit},
-            headers=_HEADERS,
-        )
+        """Address geocoding, bounded to the region.
+
+        Unbounded, this is a worldwide search: "Parks Mall" or "Main Street"
+        spends every slot on higher-ranked places in other cities, which the
+        frontend then greys out as "outside the current area" — the search
+        appears to work and returns nothing usable. viewbox+bounded confines it
+        to the box the routing tiles actually cover.
+        """
+        from mapdata.region_config import load_bbox
+
+        params: dict[str, str | int] = {"q": query, "format": "json", "limit": limit}
+        bbox = load_bbox()
+        if bbox is not None:
+            # Nominatim's viewbox order is left,top,right,bottom.
+            params["viewbox"] = f"{bbox.min_lon},{bbox.max_lat},{bbox.max_lon},{bbox.min_lat}"
+            params["bounded"] = 1
+        response = await self._client.get(_NOMINATIM_URL, params=params, headers=_HEADERS)
         response.raise_for_status()
         return [
             Address(

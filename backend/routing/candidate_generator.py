@@ -27,6 +27,7 @@ import logging
 import math
 from dataclasses import dataclass, field
 
+from routing.lane_guidance import merge_lane_guidance
 from services.signal_processor import compute_route_adherence, decode_polyline
 
 logger = logging.getLogger(__name__)
@@ -198,7 +199,7 @@ async def generate_candidates(
     strategies = strategies_for(mode) if sweep else (_BASELINE,)
 
     async def run(strategy: Strategy):
-        return await router.get_route(
+        request = dict(
             origin=origin,
             destination=destination,
             waypoints=waypoints,
@@ -207,6 +208,24 @@ async def generate_candidates(
             costing=mode,
             costing_overrides=strategy.costing_options or None,
         )
+        # The same route asked for twice, concurrently: once natively (the
+        # response we return and persist) and once in OSRM shape purely to
+        # harvest turn lanes, which 3.5.1 emits in no other format. See
+        # routing/lane_guidance.py for why this is a graft and not a migration.
+        native, osrm = await asyncio.gather(
+            router.get_route(**request),
+            router.get_route(**request, response_format="osrm"),
+            # Lane guidance is a nicety; the route is not. A failed or slow
+            # OSRM call must cost the strip, never the trip.
+            return_exceptions=True,
+        )
+        if isinstance(native, BaseException):
+            raise native
+        if isinstance(osrm, BaseException):
+            logger.warning("Lane guidance unavailable for %r: %s", strategy.key, osrm)
+        else:
+            merge_lane_guidance(native, osrm)
+        return native
 
     # return_exceptions: an exploratory strategy that errors (or a costing
     # option this Valhalla build rejects) must not take the whole request down.

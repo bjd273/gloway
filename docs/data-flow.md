@@ -53,24 +53,29 @@ sequenceDiagram
     participant Factory as mapdata.factory
     participant Hybrid as HybridMapDataSource
     participant Overture as OvertureMapDataSource (duckdb)
+    participant OsmPoi as OsmPlacesSource (duckdb)
     participant OSM as OSMMapDataSource (Nominatim)
 
     FE->>API: GET /search?q=...
     API->>Factory: get_map_data_source()
     Factory->>Hybrid: constructed per settings.map_data_source
-    API->>Hybrid: search_addresses(q, limit=5)
+    API->>Hybrid: search_addresses(q, limit=10)
     par concurrently (asyncio.gather)
-        Hybrid->>Overture: search_addresses(q, limit)
-        Hybrid->>OSM: search_addresses(q, limit)
+        Hybrid->>Overture: search_addresses(q, limit*4)
+        Hybrid->>OsmPoi: search_addresses(q, limit*4)
+        Hybrid->>OSM: search_addresses(q, limit*4)
     end
-    Overture-->>Hybrid: place-name matches (parquet ILIKE)
-    OSM-->>Hybrid: Nominatim address matches
-    Note over Hybrid: de-dupe within ~50m,<br/>Overture copy wins (cleaner name)
+    Overture-->>Hybrid: name / brand / category / address matches
+    OsmPoi-->>Hybrid: matches from the same data the map labels
+    OSM-->>Hybrid: Nominatim addresses, bounded to the region
+    Note over Hybrid: rank the union (ranking.py),<br/>then de-dupe, then truncate
     Hybrid-->>API: merged Address[]
     API-->>FE: {results: [{lat, lon, display_name}]}
 ```
 
-Either branch failing (`return_exceptions=True` in the `asyncio.gather`) degrades to just the other's results rather than failing the whole search — see `hybrid_source.py`.
+Any branch failing (`return_exceptions=True` in the `asyncio.gather`) degrades to the other sources' results rather than failing the whole search — see `hybrid_source.py`.
+
+Each source is asked for more than the caller wants so the ranker has candidates to choose between; ranking happens **after** the merge, or a source listed first could fill the limit with weak matches and discard a better one another source had found. Two places supply results because the map's labels and Overture are different providers with different vocabularies — see [Decisions](decisions.md#destination-search-indexes-osm-as-well-as-overture).
 
 ## 3. Pre-trip conversation
 
@@ -144,7 +149,14 @@ sequenceDiagram
 One position source feeds four consumers plus the backend. `DriveController` has two
 interchangeable modes — `real` (`watchPosition`) and `sim` (walks the route's own coordinates on
 a timer, selected with `?sim=1`) — and everything downstream is identical in both, which is what
-makes sim an honest stand-in outside the tiled region.
+makes sim an honest stand-in outside the tiled region. That equivalence is load-bearing and has to
+be maintained: sim fills course, speed and snap confidence with real values rather than leaving
+them blank, and `?sim=1&jitter=8` scatters its emitted position so the snapping path can be
+exercised without a car.
+
+Note the two rates. Fixes arrive about once a second and update the camera's *target*; the camera
+itself moves every animation frame. And note which position goes where: the display position is
+snapped to the road, the position sent to the backend never is.
 
 ```mermaid
 sequenceDiagram
@@ -155,16 +167,21 @@ sequenceDiagram
     participant API as POST .../trips/{id}/gps-update
     participant DB as Postgres
 
-    loop every fix (real: ≥1000ms throttle · sim: 800ms)
-        GPS->>DC: {lat, lng}
-        DC->>DC: project onto nearest route coordinate
-        DC->>Store: onPosition {lng, lat}
+    loop every fix (real: every usable fix · sim: 800ms)
+        GPS->>DC: {lat, lng, accuracy, heading, speed}
+        DC->>DC: reject unusable fixes (accuracy > 100m, implied speed > 60m/s)
+        DC->>DC: project perpendicularly onto the route (windowed)
+        DC->>DC: snapConfidence → blend display position toward the road
+        DC->>Store: onPosition — display position AND raw fix, course, speed
         DC->>Store: onProgress — fraction of route LENGTH, not coordinate count
-        DC->>DC: buffer {lat, lon, timestamp}
-        Store->>Map: currentPosition → move the heading puck
+        DC->>DC: buffer the RAW {lat, lon, timestamp} (≥1000ms apart)
+        Store->>Map: navFix → camera target + puck arrow bearing
         Store->>Map: navProgress → setRouteProgress() greys the traveled span
-        Store->>Map: bearingAtFraction() → camera bearing, zoom 16.8, pitch 55
         Note over Store: also drives TripSheet's progress bar<br/>and NavVoice's spoken remaining time
+    end
+
+    loop every animation frame, independent of fixes
+        Map->>Map: DriveCamera eases toward the target and moves the puck
     end
 
     loop every 3000ms

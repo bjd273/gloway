@@ -16,10 +16,11 @@ import pytest
 from mapdata.factory import get_map_data_source
 from mapdata.hybrid_source import HybridMapDataSource
 from mapdata.models import BBox, PlaceCategory
+from mapdata.osm_places_source import OsmPlacesSource
 from mapdata.osm_source import OSMMapDataSource
 from mapdata.overture_source import OvertureMapDataSource
 
-IMPLEMENTATIONS = ["osm", "overture", "hybrid"]
+IMPLEMENTATIONS = ["osm", "overture", "osm_places", "hybrid"]
 
 _EMPTY_OCEAN_BBOX = BBox(min_lat=0.0, min_lon=-30.0, max_lat=0.5, max_lon=-29.5)
 
@@ -38,15 +39,20 @@ requires_network = pytest.mark.skipif(
 
 
 @pytest.fixture(params=IMPLEMENTATIONS)
-async def source(request, tiny_places_parquet):
+async def source(request, tiny_places_parquet, tiny_osm_places_parquet):
     if request.param == "osm":
         impl = OSMMapDataSource()
     elif request.param == "overture":
         impl = OvertureMapDataSource(places_path=tiny_places_parquet)
+    elif request.param == "osm_places":
+        impl = OsmPlacesSource(places_path=tiny_osm_places_parquet)
     else:
         impl = HybridMapDataSource(
             routing_source=OSMMapDataSource(),
-            places_source=OvertureMapDataSource(places_path=tiny_places_parquet),
+            places_sources=[
+                OvertureMapDataSource(places_path=tiny_places_parquet),
+                OsmPlacesSource(places_path=tiny_osm_places_parquet),
+            ],
         )
     yield impl
     if hasattr(impl, "aclose"):
@@ -70,9 +76,9 @@ async def test_foreign_place_id_returns_none_without_network(source):
 
 
 async def test_get_routing_graph_ref_reports_osm_source(source):
-    if isinstance(source, OvertureMapDataSource):
-        # Routing graphs are OSM-only by design; the pure-Overture source
-        # raising here is the documented contract, not a violation.
+    if isinstance(source, (OvertureMapDataSource, OsmPlacesSource)):
+        # Routing graphs are OSM-only by design; a pure places source raising
+        # here is the documented contract, not a violation.
         with pytest.raises(NotImplementedError):
             await source.get_routing_graph_ref(_EMPTY_OCEAN_BBOX)
         return
@@ -100,8 +106,8 @@ async def test_get_places_returns_empty_list_not_none(source):
 @pytest.mark.integration
 @requires_network
 async def test_search_addresses_returns_normalized_type(source):
-    if isinstance(source, OvertureMapDataSource):
-        pytest.skip("pure Overture has no geocoder; name search is covered offline")
+    if isinstance(source, (OvertureMapDataSource, OsmPlacesSource)):
+        pytest.skip("a pure places source has no geocoder; name search is covered offline")
     results = await source.search_addresses("Arlington, TX", limit=1)
     assert results
     assert results[0].lat and results[0].lon

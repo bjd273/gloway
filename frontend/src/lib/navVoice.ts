@@ -19,6 +19,8 @@ export interface NavContext {
   progress: number
   minutesRemaining: number | null
   nextManeuver: string | null
+  /** Distance to that maneuver. Null before a drive starts tracking steps. */
+  metersToManeuver?: number | null
 }
 
 export type NavVoiceState = 'connecting' | 'idle' | 'listening' | 'thinking' | 'error' | 'closed'

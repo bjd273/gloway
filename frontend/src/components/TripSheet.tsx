@@ -19,7 +19,7 @@ import { formatMiles, formatMinutes, routeDisplayOrder, routeLabels } from '../l
 import { useSystemTheme } from '../hooks/useSystemTheme'
 import { useDebriefStore } from '../stores/useDebriefStore'
 import { useSheetStore } from '../stores/useSheetStore'
-import { useTripStore } from '../stores/useTripStore'
+import { SIM_SPEEDS, type SimSpeed, useTripStore } from '../stores/useTripStore'
 import { useUserStore } from '../stores/useUserStore'
 import { ChatBar } from './ChatBar'
 import { Debrief } from './Debrief'
@@ -36,6 +36,30 @@ const MODES: { mode: TravelMode; icon: string; label: string }[] = [
 /** Cards shown before "More ways" — the recommendation plus two to weigh it against. */
 const COLLAPSED_CARDS = 3
 
+function SimSpeedChips({
+  value,
+  onChange,
+}: {
+  value: SimSpeed
+  onChange: (speed: SimSpeed) => void
+}) {
+  return (
+    <div className="trip-simspeed" role="group" aria-label="Simulation speed">
+      {SIM_SPEEDS.map((speed) => (
+        <button
+          key={speed}
+          type="button"
+          className={'trip-chip' + (value === speed ? ' trip-chip--active' : '')}
+          aria-pressed={value === speed}
+          onClick={() => onChange(speed)}
+        >
+          {speed}×
+        </button>
+      ))}
+    </div>
+  )
+}
+
 export function TripSheet() {
   const routes = useTripStore((s) => s.routes)
   const selectedIndex = useTripStore((s) => s.selectedIndex)
@@ -51,6 +75,9 @@ export function TripSheet() {
   const setDriveMode = useTripStore((s) => s.setDriveMode)
   const navPhase = useTripStore((s) => s.navPhase)
   const navProgress = useTripStore((s) => s.navProgress)
+  const guidance = useTripStore((s) => s.guidance)
+  const simSpeed = useTripStore((s) => s.simSpeed)
+  const setSimSpeed = useTripStore((s) => s.setSimSpeed)
   const arrived = useTripStore((s) => s.arrived)
   const selectRoute = useTripStore((s) => s.selectRoute)
   const hoverRoute = useTripStore((s) => s.hoverRoute)
@@ -172,21 +199,10 @@ export function TripSheet() {
 
   const selected = routes[selectedIndex]
 
-  // Which step the driver is on, from progress along the route's total
-  // distance. Only meaningful while navigating.
-  let currentStepIndex = -1
-  if (navPhase === 'navigating' && selected) {
-    const drivenMiles = navProgress * selected.miles
-    let cumulative = 0
-    for (let i = 0; i < selected.steps.length; i += 1) {
-      cumulative += selected.steps[i].miles
-      if (drivenMiles <= cumulative) {
-        currentStepIndex = i
-        break
-      }
-    }
-    if (currentStepIndex === -1) currentStepIndex = selected.steps.length - 1
-  }
+  // Read, not re-derived. This used to recompute the step from cumulative
+  // miles, as did NavVoice, and the two disagreed at leg boundaries; the drive
+  // controller now tracks it against the engine's own shape indices.
+  const currentStepIndex = guidance?.stepIndex ?? -1
 
   // No destination yet: the sheet is the search surface.
   if (!destination) {
@@ -413,6 +429,11 @@ export function TripSheet() {
                   Arrive
                 </button>
               </div>
+              {/* Mid-drive too, not just before it: the whole point of a
+                  playback speed is changing it while watching. 1x is the
+                  honest pace for judging whether a turn countdown reads
+                  right; 8x is for getting to the end of the route. */}
+              {driveMode === 'sim' && <SimSpeedChips value={simSpeed} onChange={setSimSpeed} />}
               <NavVoice />
             </>
           ) : (
@@ -433,6 +454,7 @@ export function TripSheet() {
                   ▶︎ Simulate
                 </button>
               </div>
+              {driveMode === 'sim' && <SimSpeedChips value={simSpeed} onChange={setSimSpeed} />}
               <div className="trip-actions">
                 <button className="gw-primary trip-start" onClick={startNavigation}>
                   Start drive

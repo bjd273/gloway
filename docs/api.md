@@ -49,6 +49,29 @@ Calculates a route and persists it as a `trips` row.
 `parseTrip()` decodes it. Requests set `directions_options.narrative`, so maneuvers carry
 `street_names`, which is what lets the client name a route by the road it follows.
 
+Each maneuver additionally carries, and the client now reads:
+
+| Field | Used for |
+|---|---|
+| `type` | The turn arrow. An integer enum (0–43), mapped in `lib/maneuverIcons.ts`. |
+| `begin_shape_index` / `end_shape_index` | Where the maneuver is performed / where its span ends. **`begin` is the turn point** — see `docs/decisions.md`, since using `end` puts every instruction one turn late. |
+| `verbal_transition_alert_instruction` | Spoken at ~0.5 mi. |
+| `verbal_pre_transition_instruction` | Spoken at ~150 ft. |
+| `verbal_succinct_transition_instruction` | Spoken fallback when the two above are absent. |
+| `verbal_multi_cue` | This line already named the *following* maneuver, so that one's warning is suppressed rather than said twice. |
+| `sign` | Exit number and "toward" badges on the banner. |
+| `roundabout_exit_count` | Drawn inside the roundabout icon. |
+| `lanes` | The lane strip. **Not native Valhalla** — grafted on from a second OSRM-format call, see `docs/backend.md`. Absent on most maneuvers. |
+
+Shape indices are **per leg**. `parseTrip()` concatenates every leg's coordinates into one array,
+so it offsets each leg's indices by the running coordinate count. Consecutive legs share their
+junction point and both copies are pushed, which is why the offset is `coords.length` with no
+`-1`; de-duplicating that point later without changing this would slide every maneuver after a
+stop by one position per leg.
+
+Lane entries are OSRM-shaped: `{indications: string[], valid: boolean, active: boolean,
+valid_indication?: string}`, one per painted lane in road order, left to right.
+
 The candidates are **not** simply "Valhalla's primary plus its alternates". `routing/candidate_generator.py`
 sweeps several costing strategies concurrently, pools every route each call returns, and de-dupes
 on geometry overlap. The three parallel arrays describe that pool, index-for-index with `routes`:

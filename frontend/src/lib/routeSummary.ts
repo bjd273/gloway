@@ -18,6 +18,27 @@ export function formatMiles(miles: number): string {
   return `${miles.toFixed(1)} mi`
 }
 
+const METERS_PER_MILE = 1609.344
+
+/**
+ * Distance to the next turn, as a driver wants to hear it.
+ *
+ * Deliberately not formatMiles. That rounds to the foot, which is right in a
+ * step list you read while parked and useless at 40 mph — a number ticking
+ * 419, 407, 395 is noise, and precision nobody can act on. Nav apps round hard
+ * and land on the same few values: 500 ft, 400 ft, a quarter mile.
+ *
+ * "Now" below 30m because at that range the junction is what you look at, not
+ * the screen.
+ */
+export function formatDistanceToTurn(meters: number): string {
+  if (meters < 30) return 'Now'
+  if (meters < 305) return `${Math.round(meters / 15.24) * 50} ft` // nearest 50 ft
+  const miles = meters / METERS_PER_MILE
+  if (miles < 10) return `${miles.toFixed(1)} mi`
+  return `${Math.round(miles)} mi`
+}
+
 /**
  * Time cost of a route relative to the recommended one.
  *

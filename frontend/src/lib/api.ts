@@ -11,10 +11,72 @@ export interface SearchResult {
   display_name: string
 }
 
+/**
+ * One painted lane on the approach to a maneuver, left to right as you face it.
+ *
+ * Grafted onto the native maneuver server-side from an OSRM-shaped response —
+ * Valhalla 3.5.1 emits lanes in no other format (see backend/routing/
+ * lane_guidance.py). Indications are strings, not the bitmask the API reference
+ * describes: "left", "right", "straight", "slight left", "sharp right",
+ * "uturn", "merge to left", "none".
+ */
+export interface LaneInfo {
+  /** Every arrow painted in this lane. A lane can serve several turns. */
+  indications: string[]
+  /** Whether this lane keeps you on the route. */
+  valid: boolean
+  /** Whether this is the lane to be in — Valhalla singles out at most one. */
+  active: boolean
+  /** Which of `indications` to follow from here. Absent when `valid` is false. */
+  valid_indication?: string
+}
+
+/** Motorway signage for a maneuver — exit numbers and what they point at. */
+export interface ManeuverSign {
+  exitNumbers?: string[]
+  exitBranches?: string[]
+  exitToward?: string[]
+  exitNames?: string[]
+}
+
 export interface RouteStep {
   text: string
   miles: number
   seconds: number
+  /**
+   * Valhalla maneuver type enum (0-43) — what the turn arrow is drawn from.
+   * Optional because a backend older than this field omits it; the icon layer
+   * falls back to a "continue" arrow rather than parsing the English in `text`,
+   * which would break on the first wording change.
+   */
+  type?: number
+  /**
+   * Indices into `ParsedRoute.coords`, ALREADY OFFSET for the multi-leg
+   * concatenation parseTrip performs. `endShapeIndex` is where the maneuver
+   * happens, which is what the drive tracker counts down to.
+   */
+  beginShapeIndex?: number
+  endShapeIndex?: number
+  /** Spoken form for the "in half a mile..." warning. */
+  verbalAlert?: string
+  /** Spoken form for the turn itself. */
+  verbalPre?: string
+  /** Spoken form for just after the turn ("continue for 2 miles"). */
+  verbalPost?: string
+  /**
+   * True when `verbalPre` already names the FOLLOWING maneuver too ("turn
+   * right onto Cooper, then turn left"). The announcer suppresses the next
+   * step's alert on this, or the driver hears the same sentence twice.
+   */
+  verbalMultiCue?: boolean
+  /** Terser spoken form, when Valhalla produced one. */
+  verbalSuccinct?: string
+  /** Which lane to be in. Absent wherever OSM carries no turn:lanes. */
+  lanes?: LaneInfo[]
+  sign?: ManeuverSign
+  /** Which spoke to leave a roundabout by — drawn inside the roundabout icon. */
+  roundaboutExitCount?: number
+  streetNames?: string[]
 }
 
 export interface ParsedRoute {
@@ -99,6 +161,10 @@ export class FriendlyError extends Error {}
 const ENGINE_DOWN_MESSAGE = "Can't reach the road network right now — try again in a moment."
 const PROFILE_DOWN_MESSAGE = "Couldn't reach your profile right now — try again in a moment."
 
+interface ValhallaSignElement {
+  text: string
+}
+
 interface ValhallaManeuver {
   instruction: string
   length: number
@@ -106,6 +172,25 @@ interface ValhallaManeuver {
   // Present only when Valhalla knows the road's name — unnamed service roads
   // and slip lanes have none, so this is routinely absent mid-route.
   street_names?: string[]
+  type?: number
+  // Per LEG, not per route — see the offsetting in parseTrip.
+  begin_shape_index?: number
+  end_shape_index?: number
+  verbal_transition_alert_instruction?: string
+  verbal_pre_transition_instruction?: string
+  verbal_post_transition_instruction?: string
+  verbal_succinct_transition_instruction?: string
+  verbal_multi_cue?: boolean
+  // Grafted on server-side from the OSRM response; absent wherever OSM has no
+  // turn:lanes for the approach.
+  lanes?: LaneInfo[]
+  roundabout_exit_count?: number
+  sign?: {
+    exit_number_elements?: ValhallaSignElement[]
+    exit_branch_elements?: ValhallaSignElement[]
+    exit_toward_elements?: ValhallaSignElement[]
+    exit_name_elements?: ValhallaSignElement[]
+  }
 }
 
 /**
@@ -149,7 +234,48 @@ interface ValhallaTrip {
   summary: { time: number; length: number; has_highway?: boolean; has_toll?: boolean }
 }
 
-function parseTrip(
+/** Sign elements carry more than text; the banner only ever shows the text. */
+function signText(elements?: ValhallaSignElement[]): string[] | undefined {
+  return elements?.length ? elements.map((e) => e.text) : undefined
+}
+
+/**
+ * Shift a per-leg shape index into the concatenated coordinate array.
+ *
+ * Explicitly checked against undefined rather than `?? ` or a truthiness test:
+ * index 0 is both falsy and by far the commonest value here (every leg's first
+ * maneuver has it), so `if (i)` would drop exactly the indices that matter.
+ */
+function offsetIndex(index: number | undefined, by: number): number | undefined {
+  return index === undefined ? undefined : index + by
+}
+
+function toStep(m: ValhallaManeuver, legOffset: number): RouteStep {
+  return {
+    text: m.instruction,
+    miles: m.length,
+    seconds: m.time,
+    type: m.type,
+    beginShapeIndex: offsetIndex(m.begin_shape_index, legOffset),
+    endShapeIndex: offsetIndex(m.end_shape_index, legOffset),
+    verbalAlert: m.verbal_transition_alert_instruction,
+    verbalPre: m.verbal_pre_transition_instruction,
+    verbalPost: m.verbal_post_transition_instruction,
+    verbalSuccinct: m.verbal_succinct_transition_instruction,
+    verbalMultiCue: m.verbal_multi_cue,
+    lanes: m.lanes,
+    roundaboutExitCount: m.roundabout_exit_count,
+    streetNames: m.street_names,
+    sign: m.sign && {
+      exitNumbers: signText(m.sign.exit_number_elements),
+      exitBranches: signText(m.sign.exit_branch_elements),
+      exitToward: signText(m.sign.exit_toward_elements),
+      exitNames: signText(m.sign.exit_name_elements),
+    },
+  }
+}
+
+export function parseTrip(
   trip: ValhallaTrip,
   label: string,
   strategy?: string,
@@ -159,12 +285,24 @@ function parseTrip(
   const steps: RouteStep[] = []
   const maneuvers: ValhallaManeuver[] = []
   for (const leg of trip.legs) {
+    // Valhalla numbers shape indices PER LEG, and this loop concatenates every
+    // leg's points into one array — so each leg's indices have to shift by how
+    // many points are already in it. Without this, every maneuver after the
+    // first stop addresses the wrong place on the line, and it gets worse with
+    // each leg.
+    //
+    // No -1, deliberately: consecutive legs SHARE their junction point and the
+    // decode below pushes BOTH copies, so `coords.length` is exactly right for
+    // the concatenation as actually performed. If that duplicate is ever
+    // removed, this has to change with it or every post-stop maneuver slides
+    // one point per leg, silently.
+    const legOffset = coords.length
     // Valhalla encodes shapes at polyline precision 6.
     for (const [lat, lng] of polyline.decode(leg.shape, 6)) {
       coords.push([lng, lat])
     }
     for (const m of leg.maneuvers) {
-      steps.push({ text: m.instruction, miles: m.length, seconds: m.time })
+      steps.push(toStep(m, legOffset))
       maneuvers.push(m)
     }
   }

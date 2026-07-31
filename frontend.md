@@ -206,11 +206,60 @@ Follow-ups deliberately not taken:
 
 ---
 
+## Turn-by-turn guidance
+
+The instructions were always in the response and nothing showed them when they mattered. During a
+drive the entire turn-by-turn UI was one bolded `<li>` in a list the sheet clips at its `peek`
+snap — the snap navigation forces.
+
+**A turn banner over the map.** Maneuver arrow, distance counting down, the instruction, a "then"
+cue, and a lane strip where the data exists. It floats rather than living in the sheet because the
+sheet is pinned to `peek` while driving, so anything in it is clipped or down by the driver's knee,
+and this is the one thing on screen that has to be readable at a glance.
+
+On mobile it spans the top. On desktop it is 360px in the top-left, directly above the sheet and
+the same width, so the two read as one column of chrome down the left with the map beside them
+rather than two cards floating at different insets.
+
+**The banner owns the top strip, so other things move.** The wordmark returns `null` while
+navigating — during a drive the banner *is* the top chrome, and branding underneath the one
+must-read element is the wrong trade. On mobile the prefs gear and re-centre pill shift below it;
+without that the gear (z-index 30) renders on top of the banner and covers its mute button. On
+desktop the gear needs no offset, and the sheet's `max-height` subtracts the banner so they never
+meet on a short window.
+
+**Spoken turns.** Valhalla writes `verbal_*` strings for exactly this and they were being
+discarded. They fire at ~0.5 mi and again at ~150 ft, on downward threshold *crossings* rather
+than a level test — a level test announces "in a half mile, turn right" while the car is still on
+the driveway, because the first maneuver is routinely that close.
+
+Turn announcements now outrank conversation. `speak()` cancelled unconditionally before this, so a
+reply about the weather could cut off "turn right onto Coop—" mid-word.
+
+**The simulator had to become honest about speed.** It covered any route in a fixed ~36 s, which
+is fine for moving a puck and useless for a countdown — a quarter mile per tick on a long route
+means "1200 feet" jumps straight to "now". It moves at the route's own pace now, with a 1×/4×/8×
+control. 1× is for judging whether a countdown reads believably; 4× is the default, because
+sitting through a 25-minute route is not a development loop.
+
+**Lane guidance is the exception, not the rule.** `turn:lanes` is an OSM property — arterials and
+highway approaches in Arlington have it, residential streets don't. The strip renders nothing when
+there's no data rather than reserving space, so the banner has to look finished without it. That
+is the design centre, not the edge case.
+
+---
+
 ## Deliberately not doing yet
 
 - **Chat-first onboarding flow.** See the strategic decision above. Revisit only if drive history
   gets rich enough that "one best route, no choices" beats showing options — that is a data
   question, not a taste question.
-- **Frontend test coverage beyond `navigation.test.ts`.** The drive loop is tested because a broken
-  GPS pipeline silently destroys training data. Layout has no equivalent failure mode, so it is not
-  worth the harness until the sheet lands and stabilises.
+- **Component-level rendering tests.** The pure logic behind the banner is well covered —
+  `maneuvers`, `lanes`, `navAnnounce`, `navigation` and `routeSummary` are all plain functions with
+  unit tests. What is *not* covered is the JSX itself, since the repo has no jsdom/testing-library
+  harness. The banner was verified by driving the running app instead. Worth adding a harness if
+  the banner grows more conditional branches than it has now.
+- **Off-route detection and automatic rerouting.** Deviating parks progress at the nearest point on
+  the route and the guidance keeps describing the route the driver has left. Every "reroute" in the
+  app today is a voice or preference command, not a response to the driver's position. This is the
+  obvious next feature and deliberately out of scope here.
