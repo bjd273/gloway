@@ -40,14 +40,14 @@ print(f'  bbox {\"$BBOX\"}  ->  {w:.1f} x {h:.1f} km  ({w * h:.0f} km2)')
 # --- 1. OSM extract ---------------------------------------------------------
 # download_osm.sh reads the same data/region.json and reuses the cached
 # ~700MB state extract, so this is a local crop, not a download.
-bold "[1/5] Cropping the OSM extract"
+bold "[1/6] Cropping the OSM extract"
 ./data/download_osm.sh
 
 # --- 2. Valhalla routing tiles ---------------------------------------------
 # The container only rebuilds when use_tiles_ignore_pbf=False; with the default
 # True it loads the cached tar and would happily serve the OLD region against
 # the new .pbf. Clearing the tar and hash file makes the rebuild unambiguous.
-bold "[2/5] Rebuilding Valhalla tiles (this is the slow one)"
+bold "[2/6] Rebuilding Valhalla tiles (this is the slow one)"
 cp data/osm/region.osm.pbf valhalla/custom_files/region.osm.pbf
 rm -f valhalla/custom_files/valhalla_tiles.tar valhalla/custom_files/file_hashes.txt
 $COMPOSE stop valhalla >/dev/null 2>&1 || true
@@ -69,7 +69,7 @@ echo "  valhalla restarted with cached tiles"
 # --- 3. Basemap vector tiles ------------------------------------------------
 # --download is a no-op once data/sources/ (~1.3GB of water polygons, Natural
 # Earth, lake centerlines) is cached from the first run.
-bold "[3/5] Building the basemap (Planetiler -> PMTiles)"
+bold "[3/6] Building the basemap (Planetiler -> PMTiles)"
 mkdir -p data/tiles
 docker run --rm -e JAVA_TOOL_OPTIONS="-Xmx2g" -v "$(pwd)/data:/data" \
   ghcr.io/onthegomap/planetiler:latest \
@@ -85,7 +85,7 @@ $COMPOSE restart martin >/dev/null 2>&1 || true
 # when the parquet is missing. Failing hard here would also skip step 5 and
 # leave the frontend's coverage gate disagreeing with the tiles just built —
 # a much worse outcome than slightly thinner POI search.
-bold "[4/5] Downloading Overture places"
+bold "[4/6] Downloading Overture places"
 if ./data/download_overture.sh; then
   PLACES_OK=1
 else
@@ -95,10 +95,26 @@ else
   echo "      OSM POI index and Nominatim, just with fewer place-name matches."
 fi
 
-# --- 5. Frontend coverage gate ---------------------------------------------
+# --- 5. OSM POI search index ------------------------------------------------
+# Built from the region.osm.pbf cropped in step 1 — the same input step 3 turns
+# into the basemap's label layer. That shared input is what makes "anything
+# labelled on the map can be found by name" true rather than coincidental;
+# Overture is a different provider with a different vocabulary and does not
+# guarantee it. Offline and quick, so unlike the Overture download this one
+# failing is worth reporting but still not fatal.
+bold "[5/6] Building the OSM POI search index"
+if ./data/build_osm_places.sh; then
+  OSM_PLACES_OK=1
+else
+  OSM_PLACES_OK=0
+  warn "Failed — destination search falls back to Overture and Nominatim."
+  echo "      Places labelled on the map may not be findable by name."
+fi
+
+# --- 6. Frontend coverage gate ---------------------------------------------
 # The frontend imports its own copy because data/ sits outside Vite's root.
 # Copying here is what stops the two from drifting.
-bold "[5/5] Syncing the frontend's copy of region.json"
+bold "[6/6] Syncing the frontend's copy of region.json"
 cp data/region.json frontend/src/lib/region.json
 echo "  frontend/src/lib/region.json updated"
 
@@ -113,13 +129,18 @@ bold "Done."
 cat <<EOF
 
   Artifacts:
-$(ls -lh data/osm/region.osm.pbf data/tiles/region.pmtiles data/overture/places.parquet 2>/dev/null | awk '{printf "    %-6s %s\n", $5, $9}')
+$(ls -lh data/osm/region.osm.pbf data/tiles/region.pmtiles data/overture/places.parquet data/osm/places.parquet 2>/dev/null | awk '{printf "    %-6s %s\n", $5, $9}')
 EOF
 
 if [ "$PLACES_OK" = "0" ]; then
   # Say it plainly: the parquet on disk still covers whatever bbox it was built
   # for, which is now narrower than the routing tiles.
   printf '\033[33m  Note: places.parquet still covers the PREVIOUS region.\033[0m\n'
+fi
+
+if [ "$OSM_PLACES_OK" = "0" ]; then
+  printf '\033[33m  Note: the OSM POI index is stale or missing — map labels are not\033[0m\n'
+  printf '\033[33m        guaranteed to be searchable.\033[0m\n'
 fi
 
 cat <<EOF

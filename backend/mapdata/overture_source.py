@@ -190,20 +190,45 @@ class OvertureMapDataSource(MapDataSource):
         )
 
     async def search_addresses(self, query: str, limit: int = 5) -> list[Address]:
-        """Place-name search, not geocoding — Nominatim keeps that job (see
-        HybridMapDataSource). No bbox filter: the parquet is already cropped
-        to the region. Prefix matches outrank substring, then confidence."""
+        """Place search across every field a driver might name a place by.
+
+        Matching only names['primary'] missed most of the corpus: 14,169 of the
+        22,438 rows carry a brand, so a store recorded as "Store #4471" with
+        brand "Walmart" was invisible to a "walmart" query. Alternate names,
+        categories ("coffee", "pharmacy") and the street line are searched for
+        the same reason — they are all things people type into a destination bar.
+
+        No bbox filter: the parquet is cropped to the region, and
+        places_coverage.check_coverage now verifies that rather than assuming it.
+        No ORDER BY either — HybridMapDataSource ranks the union of all sources
+        with one scorer, so ordering here would only be undone.
+        """
         if not self._available or not query.strip():
             return []
-        sql = """
-            SELECT id, names['primary'], bbox.xmin, bbox.ymin, addresses
+        # Overture category slugs are underscore-separated ("gas_station"), so
+        # they are matched with underscores flattened to spaces — otherwise
+        # "gas station" finds nothing while "gas_station" works, which is not a
+        # distinction anyone typing a destination knows to make.
+        haystacks = (
+            "names['primary']",
+            "array_to_string(map_values(names['common']), ' ')",
+            "brand.names.primary",
+            "replace(categories['primary'], '_', ' ')",
+            "replace(array_to_string(categories['alternate'], ' '), '_', ' ')",
+            "addresses[1].freeform",
+        )
+        where = " OR ".join(f"{h} ILIKE '%' || ? || '%'" for h in haystacks)
+        sql = f"""
+            SELECT id, names['primary'], bbox.xmin, bbox.ymin, addresses,
+                   categories['primary'], brand.names.primary
             FROM read_parquet(?)
-            WHERE names['primary'] ILIKE '%' || ? || '%'
-            ORDER BY (names['primary'] ILIKE ? || '%') DESC, confidence DESC NULLS LAST
+            WHERE names['primary'] IS NOT NULL AND ({where})
             LIMIT ?
         """
         q = query.strip()
-        rows = await asyncio.to_thread(self._query, sql, [self._path, q, q, limit])
+        rows = await asyncio.to_thread(
+            self._query, sql, [self._path, *([q] * len(haystacks)), limit]
+        )
         return [
             Address(
                 id=f"overture:place/{row[0]}",
@@ -211,6 +236,9 @@ class OvertureMapDataSource(MapDataSource):
                 lat=row[3],
                 lon=row[2],
                 source="overture",
+                # Scored separately by ranking.py so a brand hit doesn't have to
+                # out-compete an address hit inside one concatenated string.
+                metadata={"name": row[1], "category": row[5], "brand": row[6]},
             )
             for row in rows
         ]

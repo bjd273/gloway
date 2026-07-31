@@ -14,7 +14,7 @@ import uuid
 from typing import Literal
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from geoalchemy2.elements import WKTElement
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -199,7 +199,7 @@ async def get_route(
 
 
 @router.get("/search")
-async def search_place(q: str, request: Request):
+async def search_place(q: str, request: Request, limit: int = Query(10, ge=1, le=25)):
     # get_map_data_source() constructs per call today (cheap: one httpx client);
     # a shared instance can move to app.state alongside the Valhalla router if
     # profiling ever says so.
@@ -207,7 +207,7 @@ async def search_place(q: str, request: Request):
 
     source = get_map_data_source()
     try:
-        results = await source.search_addresses(q, limit=5)
+        results = await source.search_addresses(q, limit=limit)
     finally:
         if hasattr(source, "aclose"):
             await source.aclose()
