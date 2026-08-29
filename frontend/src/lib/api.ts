@@ -341,6 +341,29 @@ export async function getRoute(request: {
   intent?: string | null
   waypoints?: { lat: number; lng: number }[]
   mode?: TravelMode
+  /**
+   * Ask for one costing strategy instead of the whole sweep.
+   *
+   * A reroute passes the strategy behind the route the driver already chose, so
+   * someone who picked "Calmer roads" is not silently put back on the fastest
+   * one at the first wrong turn. It also makes the request a single Valhalla
+   * call, which matters when the answer is wanted mid-drive.
+   */
+  strategy?: string
+  /**
+   * Which route of the response being replaced was actually being driven.
+   *
+   * Selecting a route is client-side only, so without this the server still
+   * believes the drive followed whichever route it recommended — and would
+   * score the pre-reroute trace against a line the driver never took.
+   */
+  selectedIndex?: number
+  /**
+   * Reroute an existing trip rather than starting a new one. The backend
+   * updates that trip in place and returns the same `trip_id`, so one drive
+   * stays one GPS trace, one completion and one debrief.
+   */
+  rerouteOf?: string | null
 }): Promise<TripResult> {
   let response: Response
   try {
@@ -358,6 +381,9 @@ export async function getRoute(request: {
         dest_label: request.destination.label ?? null,
         waypoints: (request.waypoints ?? []).map((wp) => ({ lat: wp.lat, lon: wp.lng })),
         mode: request.mode ?? 'auto',
+        strategy: request.strategy ?? null,
+        selected_index: request.selectedIndex ?? null,
+        reroute_of_trip_id: request.rerouteOf ?? null,
       }),
     })
   } catch {

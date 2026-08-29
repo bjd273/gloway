@@ -8,6 +8,7 @@ from services.signal_processor import (
     compute_implicit_reward,
     compute_implicit_signals,
     compute_route_adherence,
+    compute_segmented_adherence,
     decode_polyline,
     route_coords_from_suggested,
 )
@@ -92,13 +93,14 @@ def test_implicit_reward_signs():
     assert -1.0 <= bad <= 1.0
 
 
-def _trip(actual_path, suggested=None, duration=None):
+def _trip(actual_path, suggested=None, duration=None, context=None):
     return SimpleNamespace(
         actual_path_taken=actual_path,
         suggested_route=suggested or {"trip": {"legs": [{"shape": encode_polyline(_ROUTE)}],
                                                "summary": {"time": 600}}},
         started_at=None,
         completed_at=None,
+        context=context or {},
         implicit_signals={"client_summary": {"duration_minutes": duration}} if duration else {},
     )
 
@@ -115,3 +117,105 @@ def test_compute_implicit_signals_end_to_end():
 def test_compute_implicit_signals_empty_without_trace():
     assert compute_implicit_signals(_trip([])) == {}
     assert compute_implicit_signals(_trip(None)) == {}
+
+
+# --- rerouting: scoring a drive whose route changed partway through ---------
+
+# A second corridor running north from where _ROUTE ends — the route a driver
+# is put on after missing a turn near the end of the first one.
+_REROUTED = [(-97.1064, 32.735 + i * 0.0004) for i in range(10)]
+
+
+def _segment(started_at: str, coords):
+    return {"started_at": started_at, "shapes": [encode_polyline(coords)]}
+
+
+def _history():
+    return [
+        _segment("2026-07-31T18:00:00+00:00", _ROUTE),
+        _segment("2026-07-31T18:05:00+00:00", _REROUTED),
+    ]
+
+
+def _trace():
+    """A drive that followed the first route, then followed the second one."""
+    before = [
+        {"lat": lat, "lon": lon, "timestamp": "2026-07-31T18:0%d:00+00:00" % i}
+        for i, (lon, lat) in enumerate(_ROUTE[:5])
+    ]
+    after = [
+        {"lat": lat, "lon": lon, "timestamp": "2026-07-31T18:0%d:00+00:00" % (5 + i)}
+        for i, (lon, lat) in enumerate(_REROUTED[:5])
+    ]
+    return before + after
+
+
+def test_segmented_adherence_scores_each_piece_against_its_own_route():
+    # The whole point. Scoring this trace against the final route alone counts
+    # the entire first half as a massive deviation from a line the driver was
+    # never shown — one missed turn would make an obedient drive look like the
+    # route was ignored, and the reward would punish a perfectly good suggestion.
+    segmented = compute_segmented_adherence(_history(), _trace())
+    assert segmented["adherence_rate"] == pytest.approx(1.0)
+    assert segmented["reroute_count"] == 1
+    assert segmented["segment_count"] == 2
+
+    naive = compute_route_adherence(
+        _REROUTED, [(p["lon"], p["lat"]) for p in _trace()]
+    )
+    assert naive["adherence_rate"] < segmented["adherence_rate"]
+
+
+def test_segmented_adherence_still_catches_a_real_deviation():
+    # It must not become a machine for laundering bad adherence into good.
+    wandered = _trace()
+    for point in wandered[1:4]:
+        point["lat"] += 0.01  # ~1.1 km north of either route
+    result = compute_segmented_adherence(_history(), wandered)
+    assert result["adherence_rate"] < 0.8
+    assert result["max_deviation_meters"] > 500
+
+
+def test_segmented_adherence_declines_when_there_is_nothing_to_segment():
+    # Callers fall through to the ordinary whole-trace path on {}, so a drive
+    # that never rerouted is scored exactly as it was before this existed.
+    assert compute_segmented_adherence(None, _trace()) == {}
+    assert compute_segmented_adherence(_history()[:1], _trace()) == {}
+
+
+def test_segmented_adherence_declines_on_unreadable_timestamps():
+    # Without usable boundaries the split would be invented, and an invented
+    # split is worse than no split at all.
+    broken = [_segment("not a date", _ROUTE), _segment("also not", _REROUTED)]
+    assert compute_segmented_adherence(broken, _trace()) == {}
+
+
+def test_untimed_points_fall_to_the_original_route():
+    # gps_update stamps anything the client didn't, so this is rare — but a
+    # point with no time is a point from before we started counting.
+    untimed = [{"lat": lat, "lon": lon} for lon, lat in _ROUTE]
+    result = compute_segmented_adherence(_history(), untimed)
+    assert result["adherence_rate"] == pytest.approx(1.0)
+
+
+def test_compute_implicit_signals_uses_the_history_when_there_is_one():
+    signals = compute_implicit_signals(
+        _trip(_trace(), context={"route_history": _history()})
+    )
+    assert signals["adherence_rate"] == pytest.approx(1.0)
+    assert signals["reroute_count"] == 1
+
+
+def test_reroutes_cost_the_route_some_reward():
+    # A reroute is the clearest behavioural evidence a drive produces short of
+    # the debrief — and one that segmented adherence deliberately hides, since
+    # each piece scores well on its own.
+    followed = {"adherence_rate": 1.0}
+    clean = compute_implicit_reward(followed, 0.0, 0, trip_completed=True)
+    once = compute_implicit_reward({**followed, "reroute_count": 1}, 0.0, 0, True)
+    many = compute_implicit_reward({**followed, "reroute_count": 9}, 0.0, 0, True)
+    assert once < clean
+    assert many < once
+    # Capped: three wrong turns on an unfamiliar drive is not three times the
+    # indictment of the route.
+    assert clean - many == pytest.approx(0.3)

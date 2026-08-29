@@ -259,7 +259,9 @@ is the design centre, not the edge case.
   unit tests. What is *not* covered is the JSX itself, since the repo has no jsdom/testing-library
   harness. The banner was verified by driving the running app instead. Worth adding a harness if
   the banner grows more conditional branches than it has now.
-- **Off-route detection and automatic rerouting.** Deviating parks progress at the nearest point on
-  the route and the guidance keeps describing the route the driver has left. Every "reroute" in the
-  app today is a voice or preference command, not a response to the driver's position. This is the
-  obvious next feature and deliberately out of scope here.
+- **Off-route detection and automatic rerouting.** Done — see `lib/offRoute.ts`. It keys off the
+  same `snapConfidence` that decides whether the puck is drawn on the road, so the reroute and the
+  screen can never disagree, and requires the deviation to hold for 6 s and 60 m of ground before
+  acting. A reroute updates the trip in place (`reroute_of_trip_id`) rather than starting a new one,
+  keeps the costing strategy the driver picked, and never changes `navPhase` — so the banner does
+  not blank and the camera does not refit. Test it without a car: `?sim=1&detour=1200`.

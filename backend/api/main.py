@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routes import conversation, feedback, routing, speech, trips, users, voice
+from api.routes import conversation, feedback, places, routing, speech, trips, users, voice
 from routing.route_ranker import RouteRanker
 from routing.valhalla_client import get_router
 
@@ -51,6 +51,7 @@ app.include_router(conversation.router, prefix="/api/v1/trips", tags=["conversat
 app.include_router(feedback.router, prefix="/api/v1/feedback", tags=["feedback"])
 app.include_router(speech.router, prefix="/api/v1/speech", tags=["speech"])
 app.include_router(voice.router, prefix="/api/v1/trips", tags=["voice"])
+app.include_router(places.router, prefix="/api/v1/places", tags=["places"])
 
 
 @app.get("/health")

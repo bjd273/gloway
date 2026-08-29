@@ -164,6 +164,18 @@ def strategies_for(mode: str) -> tuple[Strategy, ...]:
     return _STRATEGIES.get(mode, _STRATEGIES["auto"])
 
 
+def strategy_by_key(mode: str, key: str | None) -> Strategy | None:
+    """Look one strategy up by its machine key, or None if there is no such key.
+
+    The key is what the client got back in `route_strategies` and hands back on a
+    reroute, so an unknown one means a stale client or a renamed strategy — the
+    caller falls back to the baseline rather than failing the request.
+    """
+    if key is None:
+        return None
+    return next((s for s in strategies_for(mode) if s.key == key), None)
+
+
 def dedupe(candidates: list[Candidate], max_candidates: int = _MAX_CANDIDATES) -> list[Candidate]:
     """Keep the first of each group of near-identical routes, capped."""
     kept: list[Candidate] = []
@@ -189,14 +201,35 @@ async def generate_candidates(
     mode: str = "auto",
     waypoints: list[tuple[float, float]] | None = None,
     max_candidates: int = _MAX_CANDIDATES,
+    only_strategy: str | None = None,
+    alternatives: int = 3,
 ) -> list[Candidate]:
     """Sweep strategies concurrently, pool the routes, drop duplicates.
 
     Always returns at least the baseline route when Valhalla is reachable; the
     caller's request must never fail because one exploratory strategy did.
+
+    `only_strategy` runs exactly one strategy instead of the sweep. That is what
+    a mid-drive reroute asks for, and it is two different wins at once: the
+    driver who chose "Calmer roads" stays on calmer roads instead of being
+    quietly returned to the fastest way at the first wrong turn, and the request
+    is one Valhalla call pair rather than six — which matters a great deal when
+    the answer is wanted while the car is moving.
+
+    The `_MIN_SWEEP_MILES` guard does not apply to it: that guard exists to skip
+    five pointless extra calls on a short trip, and with one strategy there are
+    no extra calls to skip.
     """
-    sweep = _straight_line_miles(origin, destination) >= _MIN_SWEEP_MILES
-    strategies = strategies_for(mode) if sweep else (_BASELINE,)
+    forced = strategy_by_key(mode, only_strategy)
+    if only_strategy is not None:
+        # An unrecognised key falls back to the baseline rather than 400ing: a
+        # reroute failing outright leaves a moving car with stale guidance,
+        # which is far worse than routing it the ordinary way.
+        strategies = (forced or _BASELINE,)
+    elif _straight_line_miles(origin, destination) >= _MIN_SWEEP_MILES:
+        strategies = strategies_for(mode)
+    else:
+        strategies = (_BASELINE,)
 
     async def run(strategy: Strategy):
         request = dict(
@@ -204,7 +237,7 @@ async def generate_candidates(
             destination=destination,
             waypoints=waypoints,
             prefs=prefs,
-            alternatives=3,          # each strategy contributes its own alternates
+            alternatives=alternatives,   # each strategy contributes its own alternates
             costing=mode,
             costing_overrides=strategy.costing_options or None,
         )

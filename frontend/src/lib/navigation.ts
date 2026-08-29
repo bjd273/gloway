@@ -58,6 +58,12 @@ const SNAP_TAU_S = 0.7
 /** ~30 mph, for a sim whose route reported no usable duration. */
 const DEFAULT_SIM_MPS = 13.4
 
+/** How far off the road's bearing a `?detour=` drives. Enough that the heading
+ * term of snapConfidence disagrees too — a wrong turn is not a parallel drift,
+ * and a detour that only tested the distance term would leave half the gate
+ * unexercised. */
+const DETOUR_TURN_DEG = 50
+
 export type DriveMode = 'real' | 'sim'
 
 /**
@@ -93,6 +99,18 @@ export interface SimOptions {
    * and the snap constants would have to be tuned in a moving car.
    */
   jitterMeters?: number
+  /**
+   * Dev only (?sim=1&detour=1200): leave the route for good at this many metres
+   * along it and drive straight off at an angle.
+   *
+   * Same argument as `jitterMeters`, one step further. A sim that rides the
+   * centreline can never take a wrong turn, so off-route detection and
+   * rerouting — the whole reroute path, end to end — would only ever be
+   * exercised by someone deliberately missing a turn in a moving car. With this
+   * the departure, the confidence collapse, the reroute and the resumed drive
+   * all happen at a desk, on the real code path.
+   */
+  detourMeters?: number
 }
 
 /**
@@ -116,6 +134,16 @@ export interface DrivePosition {
   accuracyM: number | null
   /** 0..1 — how much of the display position came from the route. */
   snapConfidence: number
+  /**
+   * Perpendicular metres from the route, or null when nothing projected.
+   *
+   * Computed here all along and thrown away: `snapConfidence` was the only thing
+   * that escaped `onFix`, and it is a blend, so nothing downstream could tell a
+   * confident 15 m from an unsure 15 m from a genuine 200 m. Off-route detection
+   * needs the raw distance as a floor under the confidence test — see
+   * lib/offRoute.ts.
+   */
+  offRouteMeters: number | null
   /** 0..1 along the route, from the projection. */
   fraction: number
   /** Date.now() when this update was produced. */
@@ -167,6 +195,16 @@ export function resolveSimJitter(): number {
   if (typeof window === 'undefined') return 0
   const raw = Number(new URLSearchParams(window.location.search).get('jitter'))
   return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 50) : 0
+}
+
+/**
+ * Metres along the route at which the sim should wander off, from `?detour=`.
+ * 0 = off (the sim follows the route, as it always has).
+ */
+export function resolveSimDetour(): number {
+  if (typeof window === 'undefined') return 0
+  const raw = Number(new URLSearchParams(window.location.search).get('detour'))
+  return Number.isFinite(raw) && raw > 0 ? raw : 0
 }
 
 // The slice of the Geolocation API the controller uses — injectable so tests
@@ -234,6 +272,10 @@ export class DriveController {
   private buffer: { lat: number; lon: number; timestamp: string }[] = []
   private idx = 0 // sim: segment cursor; real: last projected segment index
   private simMeters = 0 // sim: distance driven along the route
+  /** Sim + ?detour=: where the route was abandoned, and on what bearing. Null
+   * until the detour point is reached, and the flag for "off route" thereafter. */
+  private detourFrom: [number, number] | null = null
+  private detourBearing = 0
   private lastDisplayAt = 0
   private lastBufferAt = 0
   private done = false
@@ -451,6 +493,7 @@ export class DriveController {
       speedMps: speed,
       accuracyM: fix.accuracyM,
       snapConfidence: projection ? this.snapWeight : 0,
+      offRouteMeters: projection ? projection.distanceMeters : null,
       fraction: progress,
       at: now,
     })
@@ -513,54 +556,100 @@ export class DriveController {
     return [lng + (r * Math.cos(theta)) / kLng, lat + (r * Math.sin(theta)) / 110_540]
   }
 
+  /** Advance the segment cursor to cover `meters`. A forward walk rather than a
+   * search: the cursor only moves ahead, and each tick covers a handful of
+   * points at most. */
+  private walkTo(meters: number): void {
+    while (
+      this.idx < this.coords.length - 1 &&
+      this.cumulative[this.idx + 1] <= meters
+    ) {
+      this.idx += 1
+    }
+  }
+
+  /** Where a detouring sim is: straight on from where it left the route, at an
+   * angle to the road it left. The odometer keeps running, so the same speed
+   * profile and multiplier drive it. */
+  private detourPosition(): [number, number] {
+    const [lng, lat] = this.detourFrom!
+    const run = Math.max(this.simMeters - (this.sim.detourMeters ?? 0), 0)
+    const rad = (this.detourBearing * Math.PI) / 180
+    const kLng = 111_320 * Math.cos((lat * Math.PI) / 180)
+    return [
+      lng + (run * Math.sin(rad)) / kLng,
+      lat + (run * Math.cos(rad)) / 110_540,
+    ]
+  }
+
   private tick(): void {
     if (this.done) return
     const multiplier = this.sim.speedMultiplier?.() ?? 1
     const speed = this.speedAt(this.simMeters)
     const advance = speed * multiplier * (TICK_MS / 1000)
-    this.simMeters = Math.min(this.simMeters + advance, this.totalMeters)
+    const detourAt = this.sim.detourMeters ?? 0
 
-    // Forward walk rather than a search: the cursor only moves ahead, and each
-    // tick covers a handful of points at most.
-    while (
-      this.idx < this.coords.length - 1 &&
-      this.cumulative[this.idx + 1] <= this.simMeters
-    ) {
-      this.idx += 1
+    // Once the route has been abandoned it no longer bounds the odometer: the
+    // end of a route the car is not on is not somewhere it can reach.
+    this.simMeters = this.detourFrom
+      ? this.simMeters + advance
+      : Math.min(this.simMeters + advance, this.totalMeters)
+
+    if (!this.detourFrom && detourAt > 0 && this.simMeters >= detourAt) {
+      this.simMeters = detourAt // depart exactly at the mark, not past it
+      this.walkTo(this.simMeters)
+      this.detourFrom = pointAtMeters(this.coords, this.cumulative, detourAt)
+      this.detourBearing = ((this.simCourse() ?? 0) + DETOUR_TURN_DEG) % 360
     }
+    if (!this.detourFrom) this.walkTo(this.simMeters)
 
-    const [trueLng, trueLat] = pointAtMeters(this.coords, this.cumulative, this.simMeters)
+    const [trueLng, trueLat] = this.detourFrom
+      ? this.detourPosition()
+      : pointAtMeters(this.coords, this.cumulative, this.simMeters)
+    const course = this.detourFrom ? this.detourBearing : this.simCourse()
     // The true driven fraction, not fractions[idx] — the sim knows exactly how
     // far it has gone, so there is no reason to round it to a shape point.
-    const progress = this.totalMeters > 0 ? this.simMeters / this.totalMeters : 0
-    const course = this.simCourse()
+    let progress =
+      this.totalMeters > 0 ? Math.min(this.simMeters, this.totalMeters) / this.totalMeters : 0
 
     const jitterMeters = this.sim.jitterMeters ?? 0
-    let lng = trueLng
-    let lat = trueLat
+    const [fixLng, fixLat] =
+      jitterMeters > 0 ? this.jitter(trueLng, trueLat, jitterMeters) : [trueLng, trueLat]
+
+    let lng = fixLng
+    let lat = fixLat
     let confidence = 1
-    if (jitterMeters > 0) {
-      // Run the scattered position through the same projection and gate the
-      // real path uses, so ?jitter= exercises the snapping rather than
-      // bypassing it. This is what makes the off-road-puck bug reproducible at
-      // a desk instead of only in a moving car.
-      const [jLng, jLat] = this.jitter(trueLng, trueLat, jitterMeters)
-      const projection = projectToRoute(this.coords, this.cumulative, [jLng, jLat], {
+    let offRouteMeters: number | null = null
+    if (jitterMeters > 0 || this.detourFrom) {
+      // Run the emitted position through the same projection and gate the real
+      // path uses, so ?jitter= and ?detour= exercise the snapping and the
+      // off-route detection rather than bypassing them. This is what makes both
+      // the off-road-puck bug and a missed turn reproducible at a desk instead
+      // of only in a moving car.
+      const projection = projectToRoute(this.coords, this.cumulative, [fixLng, fixLat], {
         fromIndex: this.idx,
         forwardMeters: Math.max(150, speed * 3),
       })
       confidence = projection
         ? snapConfidence({
             distanceMeters: projection.distanceMeters,
-            accuracyMeters: jitterMeters,
+            accuracyMeters: jitterMeters > 0 ? jitterMeters : null,
             courseDeg: course,
             segmentBearing: projection.segmentBearing,
           })
         : 0
       this.snapWeight += (confidence - this.snapWeight) * smoothFactor(TICK_MS / 1000, SNAP_TAU_S)
-      lng = projection ? lerp(jLng, projection.lng, this.snapWeight) : jLng
-      lat = projection ? lerp(jLat, projection.lat, this.snapWeight) : jLat
+      lng = projection ? lerp(fixLng, projection.lng, this.snapWeight) : fixLng
+      lat = projection ? lerp(fixLat, projection.lat, this.snapWeight) : fixLat
       confidence = this.snapWeight
+      offRouteMeters = projection ? projection.distanceMeters : null
+      // Off the route the odometer says nothing about progress along it — the
+      // projection does. Under jitter alone the forward walk is still correct
+      // and better behaved than a noisy projection, so leave it be.
+      if (projection && this.detourFrom) {
+        progress = projection.fraction
+        this.idx = projection.index
+      }
     }
 
     this.handlers.onPosition({
@@ -568,19 +657,21 @@ export class DriveController {
       lat,
       // The sim buffers its TRUE position even under jitter: the noise exists to
       // test the display path, and feeding it to the backend would corrupt the
-      // adherence signal with error the car never had.
+      // adherence signal with error the car never had. A detour is different —
+      // the car genuinely went there, so that deviation belongs in the trace.
       rawLng: trueLng,
       rawLat: trueLat,
       courseDeg: course,
       speedMps: speed,
       accuracyM: jitterMeters > 0 ? jitterMeters : 0,
       snapConfidence: confidence,
+      offRouteMeters,
       fraction: progress,
       at: Date.now(),
     })
     this.handlers.onProgress(progress)
     this.buffer.push({ lat: trueLat, lon: trueLng, timestamp: new Date().toISOString() })
-    if (this.simMeters >= this.totalMeters) this.arrive()
+    if (!this.detourFrom && this.simMeters >= this.totalMeters) this.arrive()
   }
 
   // --- shared ------------------------------------------------------------

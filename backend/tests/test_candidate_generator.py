@@ -231,3 +231,64 @@ def test_mode_specific_strategies():
 def test_straight_line_miles_is_sane():
     # ~6.2 miles north-south.
     assert _straight_line_miles((32.79, -97.12), (32.70, -97.12)) == pytest.approx(6.2, abs=0.3)
+
+
+# --- rerouting: one strategy, not the sweep -------------------------------
+#
+# A mid-drive reroute must put the driver back on the KIND of route they chose.
+# Someone who picked "Calmer roads" over the fastest way did not change their
+# mind by missing a turn, and quietly returning them to the highway is the app
+# overruling them at the moment they are least able to argue about it.
+
+
+@pytest.mark.asyncio
+async def test_only_strategy_runs_exactly_that_one():
+    router = StubRouter({"default": _response(NORTH)})
+    cands = await generate_candidates(
+        router, (32.79, -97.12), (32.70, -97.12), only_strategy="relaxed"
+    )
+    assert router.calls == [{"top_speed": 45}]
+    assert [c.strategy for c in cands] == ["relaxed"]
+
+
+@pytest.mark.asyncio
+async def test_only_strategy_ignores_the_short_trip_guard():
+    # The guard exists to skip five pointless extra calls on a short hop. With
+    # one strategy there are no extra calls to skip, and honouring the driver's
+    # choice matters just as much two blocks from home.
+    router = StubRouter({"default": _response(NORTH)})
+    await generate_candidates(
+        router, (32.7200, -97.1200), (32.7210, -97.1200), only_strategy="avoid_highways"
+    )
+    assert router.calls == [{"use_highways": 0.0}]
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_strategy_falls_back_to_the_baseline():
+    # A stale client or a renamed strategy. Failing the request outright would
+    # leave a moving car following guidance it has already left behind, which is
+    # far worse than routing it the ordinary way.
+    router = StubRouter({"default": _response(NORTH)})
+    cands = await generate_candidates(
+        router, (32.79, -97.12), (32.70, -97.12), only_strategy="no_such_strategy"
+    )
+    assert router.calls == [None]
+    assert [c.strategy for c in cands] == ["fastest"]
+
+
+@pytest.mark.asyncio
+async def test_alternatives_are_forwardable_so_a_reroute_can_ask_for_none():
+    # Variety nobody will be offered mid-drive is latency and a round of O(n^2)
+    # shapely de-duplication spent for nothing.
+    captured = {}
+
+    class Recording(StubRouter):
+        async def get_route(self, *, alternatives=3, **kwargs):
+            captured.setdefault("alternatives", alternatives)
+            return await super().get_route(alternatives=alternatives, **kwargs)
+
+    router = Recording({"default": _response(NORTH)})
+    await generate_candidates(
+        router, (32.79, -97.12), (32.70, -97.12), only_strategy="fastest", alternatives=0
+    )
+    assert captured["alternatives"] == 0

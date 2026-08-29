@@ -16,9 +16,12 @@ import {
   type DriveMode,
   type DrivePosition,
   resolveDriveMode,
+  resolveSimDetour,
   resolveSimJitter,
 } from '../lib/navigation'
+import { OffRouteDetector } from '../lib/offRoute'
 import { cumulativeMeters } from '../lib/routeProgress'
+import { stopsAhead } from '../lib/stops'
 import { primeSpeech, speak } from '../lib/voice'
 import { useUserStore } from './useUserStore'
 import { useVoiceStore } from './useVoiceStore'
@@ -37,6 +40,13 @@ let driveController: DriveController | null = null
 let maneuverTracker: ManeuverTracker | null = null
 let turnAnnouncer: TurnAnnouncer | null = null
 let routeMeters = 0
+
+// Watches how far the driver is from the route and says when to reroute. Unlike
+// the tracker and the announcer this one SURVIVES a reroute — it carries the
+// cooldown and the rolling "how many reroutes lately" window, which is the whole
+// mechanism keeping reroutes rare. Rebuilding it per route would reset the cap
+// on every use of the cap.
+let offRouteDetector: OffRouteDetector | null = null
 
 // How fast a simulated drive plays back. 4x by default: 1x is the honest
 // speed and the right setting for checking that a turn countdown looks
@@ -67,6 +77,7 @@ function endDrive(): void {
   driveController = null
   maneuverTracker = null
   turnAnnouncer = null
+  offRouteDetector = null
   routeMeters = 0
 }
 
@@ -185,6 +196,18 @@ interface TripState {
    * neither could detect a step *transition* — so nothing could fire on one.
    */
   guidance: ManeuverProgress | null
+  /** A reroute request is in flight. The old route is still being driven and
+   * still being guided — this only says a better one has been asked for. */
+  rerouting: boolean
+  /** Reroutes on this trip so far. */
+  rerouteCount: number
+  /**
+   * Automatic rerouting has stood down — too many reroutes (or failures) in too
+   * short a window, which means we are either fighting the driver or the routing
+   * engine is unwell. The UI offers a manual Reroute button instead of silently
+   * doing nothing. Clears itself once the window slides on.
+   */
+  rerouteExhausted: boolean
   /** Playback speed for a simulated drive (1x, 4x, 8x). Persisted. */
   simSpeed: SimSpeed
   /** Set when a drive reaches its destination — TripPanel opens the debrief. */
@@ -219,6 +242,15 @@ interface TripState {
   startNavigation(): void
   /** Stop streaming (manual "Arrive" or trip cleared). */
   stopNavigation(): void
+  /**
+   * Re-route from where the car is now, without ending the drive.
+   *
+   * `from` is the point to route from; omit it to use the live GPS fix, which
+   * is what a manual "Reroute" button wants. Keeps the trip, the tripId and the
+   * GPS trace intact, preserves the costing strategy behind the route the
+   * driver chose, and leaves the old route in place if the request fails.
+   */
+  reroute(from?: Place): Promise<void>
   /** Voice loop: resume the drive on the next reroute (see reArmAfterReroute). */
   armReroute(): void
   /** TripPanel consumes the `arrived` flag after opening the debrief. */
@@ -270,6 +302,125 @@ export const useTripStore = create<TripState>((set, get) => {
     }
   }
 
+  /**
+   * Re-route after the stop list changed.
+   *
+   * Mid-drive this must NOT go through refreshRoute: requestRoute ends the drive
+   * by design (it is replacing the geometry the puck follows), which was fine
+   * when the only way to add a stop was to ask the assistant before setting off.
+   * A "stop for gas" button that ends the trip is not a button anyone can use,
+   * so during a drive the change goes through the reroute path instead — same
+   * trip, same trace, drive uninterrupted.
+   */
+  function applyStopChange(): void {
+    if (get().navPhase === 'navigating') void get().reroute()
+    else get().refreshRoute()
+  }
+
+  /**
+   * Build and start the machinery for a drive along `route`.
+   *
+   * One function for both the ways a drive begins — the Start button and a
+   * mid-drive reroute — for exactly the reason endDrive() is one function for
+   * the four ways one ends. The tracker, the announcer and the controller must
+   * be built against the SAME geometry; a second copy of this is how one of them
+   * ends up holding the old route's boundaries and every turn comes a step late.
+   *
+   * `fresh` is what separates the two callers: a new drive gets a new off-route
+   * detector and arms the sim's ?detour= affordance, a reroute keeps the
+   * detector (it carries the cooldown and the rate cap) and must not detour
+   * again on the route it was just given.
+   */
+  function beginDrive(route: ParsedRoute, tripId: string, fresh: boolean): void {
+    const coords = route.coords
+    const cumulative = cumulativeMeters(coords)
+    routeMeters = cumulative[cumulative.length - 1] ?? 0
+    const boundaries = stepBoundaries(route.steps, cumulative)
+    maneuverTracker = new ManeuverTracker(boundaries)
+    turnAnnouncer = new TurnAnnouncer(route.steps, speak, () =>
+      useVoiceStore.getState().voiceGuidance,
+    )
+    if (fresh || !offRouteDetector) offRouteDetector = new OffRouteDetector(Date.now())
+
+    driveController = new DriveController(
+      tripId,
+      coords,
+      {
+        // Both written in one set(): `currentPosition` stays the simple
+        // {lng,lat} compatibility surface everything already reads, and
+        // `navFix` carries what the camera and the puck arrow need. Writing
+        // them together is what stops the two describing different moments.
+        onPosition: (p) => {
+          set({ currentPosition: { lng: p.lng, lat: p.lat, label: 'You' }, navFix: p })
+          // Off-route detection rides the position channel because that is where
+          // the projection already happened — no second pass over the geometry,
+          // and no second opinion about where the driver is. `p.fraction *
+          // routeMeters` is the distance driven by construction, the same
+          // identity onProgress relies on below.
+          const verdict = offRouteDetector?.update({
+            offRouteMeters: p.offRouteMeters,
+            snapConfidence: p.snapConfidence,
+            rawLng: p.rawLng,
+            rawLat: p.rawLat,
+            metersDriven: p.fraction * routeMeters,
+            routeMeters,
+            gpsSignalLost: get().gpsSignalLost,
+            at: p.at,
+          })
+          if (verdict) void get().reroute(verdict)
+        },
+        onProgress: (fraction) => {
+          // No separate handler for guidance: `fraction * routeMeters` IS the
+          // distance driven, in both modes, by construction. A parallel
+          // channel would be a second source for one number, free to drift.
+          const guidance = maneuverTracker?.update(fraction * routeMeters) ?? null
+          // Announcing here rather than in a React effect keyed on
+          // `guidance`: this runs exactly once per position update, with no
+          // dependence on render timing, StrictMode double-invocation or
+          // subscriber ordering.
+          if (guidance) turnAnnouncer?.update(guidance)
+          set({ navProgress: fraction, guidance })
+        },
+        onArrive: () => {
+          endDrive()
+          set({ navPhase: 'idle', navProgress: 1, arrived: true, rerouting: false })
+        },
+        // Real mode only: no fixes means no drive (and no trace to learn
+        // from) — end navigation and say why instead of showing a frozen puck.
+        onGpsError: (message) => {
+          endDrive()
+          set({
+            navPhase: 'idle',
+            currentPosition: null,
+            navFix: null,
+            navProgress: 0,
+            rerouting: false,
+            errorMessage: message,
+          })
+        },
+        // A tunnel or a parking garage, not a dead drive. The puck freezes
+        // where it was and the banner says so; the watch keeps retrying and
+        // this flips back on the next good fix.
+        onGpsSignal: (lost) => set({ gpsSignalLost: lost }),
+      },
+      get().driveMode,
+      undefined,
+      {
+        // The route's own average pace, so a simulated drive takes about as
+        // long as the real one would at 1x.
+        metersPerSecond: simSpeedFor(route),
+        speedProfile: speedProfile(route, boundaries),
+        speedMultiplier: () => get().simSpeed,
+        jitterMeters: resolveSimJitter(),
+        // Only on a fresh drive. ?detour= exists to produce one wrong turn to
+        // reroute away from; re-arming it on the replacement route would leave
+        // at the same mark again and loop forever.
+        detourMeters: fresh ? resolveSimDetour() : 0,
+      },
+    )
+    driveController.start()
+  }
+
   return {
     origin: null,
     destination: null,
@@ -290,6 +441,9 @@ export const useTripStore = create<TripState>((set, get) => {
     gpsSignalLost: false,
     navProgress: 0,
     guidance: null,
+    rerouting: false,
+    rerouteCount: 0,
+    rerouteExhausted: false,
     simSpeed: initialSimSpeed(),
     arrived: false,
     mapCenter: { lng: -97.11, lat: 32.735, label: 'Map center' },
@@ -342,18 +496,18 @@ export const useTripStore = create<TripState>((set, get) => {
 
     addStop(p) {
       set({ stops: [...get().stops, p] })
-      get().refreshRoute()
+      applyStopChange()
     },
 
     removeStop(index) {
       set({ stops: get().stops.filter((_, i) => i !== index) })
-      get().refreshRoute()
+      applyStopChange()
     },
 
     clearStops() {
       if (get().stops.length === 0) return
       set({ stops: [] })
-      get().refreshRoute()
+      applyStopChange()
     },
 
     setMode(mode) {
@@ -401,14 +555,6 @@ export const useTripStore = create<TripState>((set, get) => {
       // click, the one tap every drive begins with.
       primeSpeech()
 
-      const cumulative = cumulativeMeters(coords)
-      routeMeters = cumulative[cumulative.length - 1] ?? 0
-      const boundaries = stepBoundaries(route.steps, cumulative)
-      maneuverTracker = new ManeuverTracker(boundaries)
-      turnAnnouncer = new TurnAnnouncer(route.steps, speak, () =>
-        useVoiceStore.getState().voiceGuidance,
-      )
-
       set({
         navPhase: 'navigating',
         navProgress: 0,
@@ -416,67 +562,105 @@ export const useTripStore = create<TripState>((set, get) => {
         gpsSignalLost: false,
         guidance: null,
         arrived: false,
+        rerouting: false,
+        rerouteCount: 0,
+        rerouteExhausted: false,
         currentPosition: origin,
       })
-      driveController = new DriveController(
-        tripId,
-        coords,
-        {
-          // Both written in one set(): `currentPosition` stays the simple
-          // {lng,lat} compatibility surface everything already reads, and
-          // `navFix` carries what the camera and the puck arrow need. Writing
-          // them together is what stops the two describing different moments.
-          onPosition: (p) =>
-            set({ currentPosition: { lng: p.lng, lat: p.lat, label: 'You' }, navFix: p }),
-          onProgress: (fraction) => {
-            // No separate handler for guidance: `fraction * routeMeters` IS the
-            // distance driven, in both modes, by construction. A parallel
-            // channel would be a second source for one number, free to drift.
-            const guidance = maneuverTracker?.update(fraction * routeMeters) ?? null
-            // Announcing here rather than in a React effect keyed on
-            // `guidance`: this runs exactly once per position update, with no
-            // dependence on render timing, StrictMode double-invocation or
-            // subscriber ordering.
-            if (guidance) turnAnnouncer?.update(guidance)
-            set({ navProgress: fraction, guidance })
-          },
-          onArrive: () => {
-            endDrive()
-            set({ navPhase: 'idle', navProgress: 1, arrived: true })
-          },
-          // Real mode only: no fixes means no drive (and no trace to learn
-          // from) — end navigation and say why instead of showing a frozen puck.
-          onGpsError: (message) => {
-            endDrive()
-            set({
-              navPhase: 'idle',
-              currentPosition: null,
-              navFix: null,
-              navProgress: 0,
-              errorMessage: message,
-            })
-          },
-          // A tunnel or a parking garage, not a dead drive. The puck freezes
-          // where it was and the banner says so; the watch keeps retrying and
-          // this flips back on the next good fix.
-          onGpsSignal: (lost) => set({ gpsSignalLost: lost }),
-        },
-        get().driveMode,
-        undefined,
-        {
-          // The route's own average pace, so a simulated drive takes about as
-          // long as the real one would at 1x.
-          metersPerSecond: simSpeedFor(route),
-          speedProfile: speedProfile(route, boundaries),
-          speedMultiplier: () => get().simSpeed,
-          jitterMeters: resolveSimJitter(),
-        },
-      )
-      driveController.start()
-      // Note on reroutes: in real mode a post-reroute restart naturally
-      // resumes from the live GPS fix (the device is the source of truth) and
-      // the first fix's projection lands navProgress mid-route
-      // correctly. Only the sim replays from the route's start.
+      beginDrive(route, tripId, true)
+    },
+
+    async reroute(from) {
+      const { destination, tripId, routes, selectedIndex, navPhase, rerouting, navFix } = get()
+      if (navPhase !== 'navigating' || !tripId || !destination || rerouting) return
+      // The raw fix, never the snapped one. The whole premise of a reroute is
+      // that the two have diverged and the raw one is the truth.
+      const start =
+        from ??
+        (navFix ? { lng: navFix.rawLng, lat: navFix.rawLat } : null) ??
+        get().currentPosition ??
+        get().origin
+      if (!start) return
+
+      set({ rerouting: true })
+      // speak() doesn't consult the mute — TurnAnnouncer does, through its own
+      // enabled() closure — so this has to check it here.
+      if (useVoiceStore.getState().voiceGuidance) speak('Rerouting', 'turn')
+
+      const current = routes[selectedIndex]
+      // Without this, a reroute sends the driver back to the coffee shop they
+      // already stopped at — and keeps doing it on every subsequent reroute.
+      const remaining = stopsAhead(get().stops, current?.coords ?? [], get().navProgress)
+
+      try {
+        const result = await getRoute({
+          origin: start,
+          destination,
+          userId: useUserStore.getState().userId,
+          intent: get().declaredIntent,
+          waypoints: remaining,
+          mode: get().mode,
+          // What preserves the driver's choice. Someone who picked "Calmer
+          // roads" over the fastest way did not change their mind by missing a
+          // turn, and silently putting them back on the highway is the app
+          // overruling them at the moment they are least able to argue.
+          strategy: current?.strategy,
+          // Which route we were actually driving. Selection never reached the
+          // server, so without this it would score the trace up to here against
+          // whichever route it recommended rather than the one we took.
+          selectedIndex,
+          rerouteOf: tripId,
+        })
+
+        // The drive can end while the request is in flight — arrival, the
+        // Arrive button, a cleared trip. Landing a fresh route on a finished
+        // drive would restart one the user just stopped.
+        if (get().navPhase !== 'navigating' || get().tripId !== tripId) {
+          set({ rerouting: false })
+          return
+        }
+        const route = result.routes[result.recommendedIndex]
+        if (!route || route.coords.length < 2) {
+          throw new FriendlyError('No usable way from here — still on the old route.')
+        }
+
+        // Stop the old controller (and flush its tail) before the new one
+        // starts, so two of them never stream to the same trip at once.
+        await driveController?.stop()
+
+        // navPhase and currentPosition are deliberately untouched: the car has
+        // not moved and the drive has not ended, so the banner must not blank
+        // and the puck must not jump. MapView's routes effect already refuses to
+        // refit the camera while navigatingRef is set, which is what keeps this
+        // from ripping the view off the driver.
+        set({
+          routes: result.routes,
+          selectedIndex: result.recommendedIndex,
+          recommendedIndex: result.recommendedIndex,
+          hoveredRouteIndex: null,
+          stops: remaining,
+          navProgress: 0,
+          guidance: null,
+          errorMessage: null,
+          rerouting: false,
+          rerouteCount: get().rerouteCount + 1,
+        })
+        beginDrive(route, tripId, false)
+        offRouteDetector?.noteRerouted(Date.now())
+        set({ rerouteExhausted: offRouteDetector?.exhausted ?? false })
+      } catch (error) {
+        // Keep driving the old route. It is stale, but it is guidance, and a
+        // failed request is no reason to leave someone mid-drive with none.
+        offRouteDetector?.noteFailed(Date.now())
+        set({
+          rerouting: false,
+          rerouteExhausted: offRouteDetector?.exhausted ?? false,
+          errorMessage:
+            error instanceof FriendlyError
+              ? error.message
+              : "Couldn't find a new way — still on the old route.",
+        })
+      }
     },
 
     async stopNavigation() {
@@ -490,6 +674,7 @@ export const useTripStore = create<TripState>((set, get) => {
           gpsSignalLost: false,
           navProgress: 0,
           guidance: null,
+          rerouting: false,
         })
       }
       // Await the final flush so a caller that completes the trip next does so
@@ -527,6 +712,9 @@ export const useTripStore = create<TripState>((set, get) => {
         gpsSignalLost: false,
         navProgress: 0,
         guidance: null,
+        rerouting: false,
+        rerouteCount: 0,
+        rerouteExhausted: false,
         arrived: false,
       })
     },

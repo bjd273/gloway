@@ -38,3 +38,4 @@ tensorboard_logs/
 
 # Local design-review tool state
 .impeccable/
+.venv2/

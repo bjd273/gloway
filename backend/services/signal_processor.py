@@ -112,6 +112,100 @@ def compute_route_adherence(
     }
 
 
+def _parse_iso(value) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _coords_from_shapes(shapes) -> list[tuple[float, float]]:
+    """Decode a route_history segment's per-leg polylines to (lon, lat)."""
+    coords: list[tuple[float, float]] = []
+    for shape in shapes or []:
+        if isinstance(shape, str) and shape:
+            coords.extend(decode_polyline(shape))
+    return coords
+
+
+def compute_segmented_adherence(
+    route_history: list | None,
+    trace_points: list,
+    deviation_threshold_meters: float = 50.0,
+) -> dict:
+    """Adherence for a drive whose route changed partway through.
+
+    A reroute replaces the line the driver is following. Scoring the whole trace
+    against the final route would count everything before the reroute as a
+    massive deviation from a route the driver was never shown — one missed turn
+    would make an otherwise obedient forty-minute drive look like the route was
+    ignored, and the reward would punish a perfectly good suggestion.
+
+    So the trace is split at each reroute (`route_history[i]["started_at"]`) and
+    each piece scored against the route that was actually active then, with the
+    pieces recombined weighted by fix count — which is what `adherence_rate`
+    already means over a single trace.
+
+    Returns {} when there's nothing to segment (fewer than two routes, or
+    timestamps we can't read), so callers fall through to the ordinary
+    whole-trace path unchanged.
+
+    Note the two clocks: segment starts are stamped server-side, trace
+    timestamps come from the browser. Both are UTC wall clocks, so skew is
+    small, and a point landing in the wrong bucket costs at most one fix — but
+    it is why a segment that ends up too small to judge is dropped below rather
+    than reported as an unknown.
+    """
+    segments = [s for s in (route_history or []) if isinstance(s, dict)]
+    if len(segments) < 2:
+        return {}
+
+    starts = [_parse_iso(s.get("started_at")) for s in segments]
+    if any(t is None for t in starts):
+        return {}
+
+    buckets: list[list[tuple[float, float]]] = [[] for _ in segments]
+    for point in trace_points:
+        if not isinstance(point, dict) or "lon" not in point or "lat" not in point:
+            continue
+        at = _parse_iso(point.get("timestamp"))
+        # The last segment that had already started. Anything stamped before the
+        # first one (or with no usable stamp) belongs to the original route.
+        index = 0
+        if at is not None:
+            for i, start in enumerate(starts):
+                if at >= start:
+                    index = i
+        buckets[index].append((point["lon"], point["lat"]))
+
+    scored: list[tuple[int, dict]] = []
+    for segment, points in zip(segments, buckets):
+        result = compute_route_adherence(
+            _coords_from_shapes(segment.get("shapes")), points, deviation_threshold_meters
+        )
+        # Too few points to judge — a segment the driver left within a second, or
+        # one whose geometry didn't survive. Dropped rather than folded in at a
+        # neutral 0.5, which would drag a real score toward the middle.
+        if result.get("adherence_rate") is not None:
+            scored.append((len(points), result))
+
+    if not scored:
+        return {}
+
+    total = sum(n for n, _ in scored)
+    return {
+        "adherence_rate": sum(n * r["adherence_rate"] for n, r in scored) / total,
+        "deviation_count": sum(r["deviation_count"] for _, r in scored),
+        "max_deviation_meters": max(r["max_deviation_meters"] for _, r in scored),
+        "mean_deviation_meters": sum(n * r["mean_deviation_meters"] for n, r in scored) / total,
+        "reroute_count": len(segments) - 1,
+        "segment_count": len(segments),
+        "scored_segments": len(scored),
+    }
+
+
 def compute_implicit_reward(
     route_adherence: dict,
     time_delta_minutes: float,
@@ -129,6 +223,13 @@ def compute_implicit_reward(
     reward += (adherence - 0.5) * 1.2                       # following is the strongest signal
     reward += float(np.clip(-time_delta_minutes / 10.0, -0.3, 0.3))  # early = good
     reward -= min(app_switch_count * 0.1, 0.3)              # switching away = frustration
+    # Every reroute is a route we suggested that the driver did not take — the
+    # clearest behavioral evidence a drive produces short of the debrief, and one
+    # that segmented adherence deliberately hides (each piece scores well on its
+    # own). Capped, because three wrong turns on an unfamiliar drive is not three
+    # times the indictment of the route. Absent from every trip recorded before
+    # rerouting existed, so this is a no-op on the existing corpus.
+    reward -= float(np.clip(0.12 * (route_adherence.get("reroute_count") or 0), 0, 0.3))
     return float(np.clip(reward, -1.0, 1.0))
 
 
@@ -171,8 +272,15 @@ def compute_implicit_signals(trip) -> dict:
     if len(trace) < 2:
         return {}
 
-    route_coords = route_coords_from_suggested(trip.suggested_route or {})
-    adherence = compute_route_adherence(route_coords, trace)
+    # A drive that rerouted has to be scored piece by piece against the route
+    # that was live for each piece; compute_segmented_adherence returns {} when
+    # there was only ever one route, so the ordinary path below is unchanged for
+    # every trip that didn't reroute.
+    adherence = compute_segmented_adherence(
+        (trip.context or {}).get("route_history"), trace_raw
+    ) or compute_route_adherence(
+        route_coords_from_suggested(trip.suggested_route or {}), trace
+    )
 
     # Actual duration: client-reported if present, else wall-clock; ETA from
     # Valhalla. time_delta 0 when neither side is known (neutral).

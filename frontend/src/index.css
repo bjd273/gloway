@@ -355,8 +355,31 @@ body {
   touch-action: none;
 }
 
-.sheet:not([data-snap='full']) .trip-steps {
-  display: none;
+/* Peek during a drive has to fit more than peek before one: the remaining-time
+   row, progress + Arrive, the add-stop chips and the voice mic all live in the
+   always-visible regions, and the sheet clips rather than scrolls, so at 26dvh
+   the mic fell off the bottom edge.
+
+   fit-content rather than another dvh constant because the driving sheet's
+   height genuinely varies — the sim-speed chips are only there in simulate
+   mode, the reroute row only when rerouting — and a fixed number would be
+   either too tall for the common case or too short for the others. Measured on
+   a 375x812 phone it lands at ~357px (44dvh) with the sim chips, ~313px
+   without, and ~525px (65dvh) for the few seconds AddStopBar is showing three
+   results — which is why it grows instead of raising the snap: `half` is a
+   fixed 50dvh and clipped both the third result and the mic under it. The
+   max-height is the backstop for a drive that accumulates enough via-chips to
+   matter: past it the scroll region shrinks (flex:1, min-height:0) and the
+   actions stay whole, which is the invariant that counts.
+
+   :has() rather than a data attribute because Sheet.tsx owns the shell and
+   knows nothing about trips — TripSheet marks its driving block, shell reacts.
+   The cost is that entering a drive doesn't animate the height, since
+   fit-content has nothing to interpolate from; a one-off snap at the start of
+   a drive is a fair trade for never clipping the mic. */
+.sheet[data-snap='peek']:has(.trip-driving) {
+  --sheet-h: fit-content;
+  max-height: 78dvh;
 }
 
 /* Desktop: back to a fixed card in the corner. No snapping, no dragging — a
@@ -377,12 +400,13 @@ body {
     touch-action: auto;
   }
 
-  .sheet .sheet-scroll,
-  .sheet:not([data-snap='full']) .trip-steps {
+  .sheet .sheet-scroll {
     display: flex;
     overflow-y: auto;
     pointer-events: auto;
   }
+  /* The peek override above is a snap height and needs no desktop counterpart:
+     the rail sets `height: auto` and never reads --sheet-h. */
 
   /* Scoped to .sheet so it outranks the base .sheet-grabber rule below, which
      appears later in the file. No snapping on desktop, so nothing to grab. */
@@ -571,8 +595,7 @@ body[data-prefs-open] .gw-bubble {
   color: var(--text);
 }
 
-.trip-alts-label,
-.trip-steps-label {
+.trip-alts-label {
   display: block;
   font-size: 11.5px;
   font-weight: 600;
@@ -746,38 +769,6 @@ body[data-prefs-open] .gw-bubble {
   background: color-mix(in srgb, var(--accent) 10%, transparent);
   color: var(--text);
   font-weight: 600;
-}
-
-/* The sheet's own scroll region handles overflow now; the step list just
-   flows inside it. */
-.trip-steps {
-  display: flex;
-  flex-direction: column;
-}
-
-.trip-steps ol {
-  margin: 0;
-  padding: 0 0 0 18px;
-  display: flex;
-  flex-direction: column;
-  gap: 9px;
-}
-
-.trip-steps li {
-  font-size: 13.5px;
-  line-height: 1.4;
-}
-
-.trip-steps li::marker {
-  color: var(--accent);
-  font-size: 12px;
-}
-
-.step-meta {
-  margin-left: 7px;
-  font-size: 12px;
-  color: var(--text-muted);
-  white-space: nowrap;
 }
 
 /* --- preferences (gear + popover) --- */
@@ -1349,6 +1340,198 @@ body[data-prefs-open] .gw-bubble {
   min-height: 44px;
 }
 
+/* --- the driving sheet ---
+   One column: progress + Arrive, reroute status, add-stop, sim speed, voice.
+   Its own wrapper rather than loose children of .sheet-actions so the :has()
+   peek-height rule near the top of this file has something to match. */
+.trip-driving {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Clock time next to the remaining minutes. Muted and small: the minutes are
+   the answer, this is the reassurance. */
+.trip-eta {
+  margin-left: auto;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.trip-reroute {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+/* Pulses rather than spins: a spinner reads as "the app is busy, wait", and
+   the driver is not waiting — the old route is still live underneath. */
+.trip-reroute-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--accent);
+  animation: trip-reroute-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes trip-reroute-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .trip-reroute-dot {
+    animation: none;
+    opacity: 1;
+  }
+}
+
+.trip-reroute-manual {
+  align-self: flex-start;
+  min-height: 44px;
+  padding: 9px 16px;
+}
+
+/* --- add a stop (in-drive category picker) --- */
+.trip-addstop {
+  display: flex;
+  gap: 7px;
+}
+
+/* Four across, evenly. Icon over label rather than beside it: at four to a row
+   the horizontal form squeezes "Charging" into two lines anyway, and stacking
+   buys the tap target height instead of spending it on text. */
+.trip-addstop-chip {
+  flex: 1;
+  min-width: 0;
+  min-height: 52px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 16px;
+  line-height: 1.1;
+  cursor: pointer;
+}
+
+.trip-addstop-chip:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.trip-addstop-chip:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.trip-addstop-label {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+.trip-addstop--open {
+  flex-direction: column;
+  gap: 8px;
+}
+
+.trip-addstop-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.trip-addstop-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.trip-addstop-close {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 13px;
+  /* 44px even though it is only a word — this is tapped in a moving car. */
+  min-height: 44px;
+  padding: 0 6px;
+  cursor: pointer;
+}
+
+.trip-addstop-note {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.trip-addstop-results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Full-width rows, not chips: the name can be long, and a row is the biggest
+   target a one-handed driver can hit without aiming. */
+.trip-addstop-result {
+  width: 100%;
+  min-height: 52px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 2px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.trip-addstop-result:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.trip-addstop-result:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.trip-addstop-name {
+  font-size: 14px;
+  font-weight: 600;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trip-addstop-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
 .debrief-done {
   align-self: flex-start;
   font-size: 13.5px;
@@ -1426,15 +1609,6 @@ body[data-prefs-open] .gw-bubble {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.step--current .step-text {
-  font-weight: 600;
-  color: var(--text);
-}
-
-.step--current::marker {
-  color: var(--glow-a);
 }
 
 /* --- trip wrap-up --- */

@@ -490,4 +490,52 @@ describe('DriveController sim mode', () => {
     expect(p.accuracyM).toBe(12)
     void controller.stop()
   })
+
+  describe('?detour=', () => {
+    /** Run a detouring sim for `seconds` and return the last position. */
+    function detour(seconds: number, tripId: string) {
+      const handlers = makeHandlers()
+      const controller = new DriveController(tripId, ROUTE, handlers, 'sim', null, {
+        metersPerSecond: 20,
+        detourMeters: 400,
+      })
+      controller.start()
+      vi.advanceTimersByTime(seconds * 1000)
+      return { handlers, controller, p: lastPosition(handlers) }
+    }
+
+    it('follows the route up to the mark, then leaves it', () => {
+      // The affordance that makes the whole reroute path testable at a desk.
+      // Without it, off-route detection could only ever be exercised by
+      // deliberately missing a turn in a moving car.
+      const onRoute = detour(15, 'trip-22') // 300m at 20 m/s — short of the mark
+      expect(onRoute.p.offRouteMeters).toBeNull() // never projected: still on the line
+      expect(onRoute.p.rawLat).toBeCloseTo(32.72, 9)
+      void onRoute.controller.stop()
+
+      const off = detour(45, 'trip-23') // well past 400m
+      expect(off.p.offRouteMeters).toBeGreaterThan(100)
+      expect(Math.abs(off.p.rawLat - 32.72)).toBeGreaterThan(latFor(100))
+      void off.controller.stop()
+    })
+
+    it('collapses snap confidence, so the puck is drawn where the car is', () => {
+      // Off-route detection keys off exactly this number — see lib/offRoute.ts.
+      // If a detour did not drive it to zero, the detector would never fire and
+      // the desk test would prove nothing.
+      const { p, controller } = detour(45, 'trip-24')
+      expect(p.snapConfidence).toBeLessThan(0.05)
+      expect(p.lat).toBeCloseTo(p.rawLat, 6)
+      void controller.stop()
+    })
+
+    it('records the detour in the trace and never arrives', () => {
+      // A detour is not jitter: the simulated car genuinely went there, so that
+      // deviation belongs in the trace the backend scores. And a route the car
+      // has left is not somewhere it can reach the end of.
+      const { handlers, controller } = detour(120, 'trip-25')
+      expect(handlers.onArrive).not.toHaveBeenCalled()
+      void controller.stop()
+    })
+  })
 })
